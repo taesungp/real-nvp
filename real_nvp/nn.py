@@ -7,10 +7,106 @@ def int_shape(x):
 def sample_from_gaussian(l):  
   return l
 
-def loss(x,l,sum_all=True):
-  y = tf.slice(x, [0, 1], [-1, 1])
-  #return tf.nn.l2_loss(tf.reshape(y,[-1]) - tf.reshape(l, [-1]))
-  return tf.reduce_sum(tf.square(tf.reshape(l,[-1])-tf.reshape(y,[-1])))
+# corresponds to the function m and l in the RealNVP paper
+# returns l,m
+def function_l_m(x,mask,name='function_l_m'):
+  with tf.variable_scope(name):
+    channel = 16
+    padding = 'SAME'
+    xs = int_shape(x)
+    kernel_h = 3
+    kernel_w = 3
+    input_channel = xs[3]
+    
+    weights_shape = [kernel_h, kernel_w, input_channel, channel]
+    weights = tf.get_variable("weights", weights_shape, tf.float32, 
+                              tf.contrib.layers.xavier_initializer())
+    y = tf.nn.conv2d(x, weights, [1, 1, 1, 1], padding=padding)
+    y = tf.nn.relu(y)
+    
+    weights = tf.get_variable("weights_output", [1, 1, channel, input_channel*2],
+                              tf.float32, tf.contrib.layers.xavier_initializer())
+    y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)    
+
+    l = y[:,:,:,:input_channel] * (-mask+1)
+    m = y[:,:,:,input_channel:] * (-mask+1)
+            
+    return l,m
+
+
+# returns constant tensor of masks
+# |xs| is the size of tensor
+# |mask_type| can be 'checkerboard0', 'checkerboard1', 'channel0', 'channel1'
+# |b| has the dimension of |xs|
+def get_mask(xs, mask_type):
+  b = tf.ones(xs)
+  
+  if 'checkerboard' in mask_type:
+    unit0 = tf.constant([[0.0, 1.0], [1.0, 0.0]])
+    unit1 = -unit0 + 1.0
+    unit = unit0 if mask_type == 'checkerboard0' else unit1
+    unit = tf.reshape(unit, [1, 2, 2, 1])
+
+    b = tf.tile(unit, [xs[0], xs[1]//2, xs[2]//2, xs[3]])
+
+  assert 'checkerboard' in mask_type
+
+  bs = int_shape(b)
+  assert bs == xs
+  
+  return b
+
+# corresponds to the coupling layer of the RealNVP paper
+# |mask_type| can be 'checkerboard0', 'checkerboard1', 'channel0', 'channel1'
+# log_det_jacobian is a 1D tensor of size (batch_size)
+def coupling_layer(x, mask_type,name='Coupling'):
+  with tf.variable_scope(name):
+    xs = int_shape(x)
+    b = get_mask(xs, mask_type)
+  
+    # masked half of x
+    x1 = x * b
+    l,m = function_l_m(x1, b)
+    y = x1 + tf.mul(-b+1.0, x*tf.check_numerics(tf.exp(l), "exp has NaN") + m)
+    log_det_jacobian = tf.check_numerics(tf.reduce_sum(l, [1,2,3]), "l has NaN")
+  
+    return y,log_det_jacobian
+
+# def inv_coupling_layer(y, mask_type, name='InvCoupling'):
+#   with tf.variable_scope(name):
+#     ys = int_shape(y)
+#     b = get_mask(ys, mask_type)
+
+#     y1 = y *b
+#     l,m = 
+
+# Given the output of the network and all jacobians, 
+# compute the log probability. 
+# Equation (3) of the RealNVP paper
+def compute_log_prob_x(z, sum_log_det_jacobians):
+  
+  # y is assumed to be in standard normal distribution
+  # 1/sqrt(2*pi)*exp(-0.5*x^2)
+  zs = int_shape(z)
+  K = zs[1]*zs[2]*zs[3] #dimension of the Gaussian distribution
+  print (0.5*K*np.log(2*np.pi))
+
+  log_density_z = -0.5*tf.reduce_sum(tf.square(z), [1,2,3]) - 0.5*K*np.log(2*np.pi)
+
+  log_density_x = log_density_z + sum_log_det_jacobians
+
+  # to go from density to probability, one can 
+  # multiply the density by the width of the 
+  # discrete probability area, which is 1/256.0, per dimension
+  log_prob_x = log_density_x - K*tf.log(256.0)
+
+  return tf.check_numerics(log_prob_x, "log_prob_x has NaN")
+
+
+def loss(z, sum_log_det_jacobians):
+  return -tf.reduce_sum(compute_log_prob_x(z, sum_log_det_jacobians))
+
+
   
   
 def adam_updates(params, cost_or_grads, lr=0.001, mom1=0.9, mom2=0.999):

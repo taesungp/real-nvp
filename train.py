@@ -15,6 +15,14 @@ import argparse
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
+from pylab import rcParams
+rcParams['figure.figsize'] = 12,22
+import datetime
+import dateutil.tz
+import scipy.misc
+from scipy import misc,ndimage
+from skimage import io, color
+import time
 
 import pixel_cnn_pp.nn as pixel_cnn_nn
 import real_nvp.nn as real_nvp_nn
@@ -35,7 +43,7 @@ parser.add_argument('-d', '--data_set', type=str, default='cifar', help='Can be 
 parser.add_argument('-t', '--save_interval', type=int, default=20, help='Every how many epochs to write checkpoint/samples?')
 parser.add_argument('-r', '--load_params', type=int, default=0, help='Restore training from previous model checkpoint? 1 = Yes, 0 = No')
 # model
-parser.add_argument('--model', type=str, default='pixel_cnn', help='model name: pixel_cnn, real_nvp')
+parser.add_argument('--model', type=str, default='real_nvp', help='model name: pixel_cnn, real_nvp')
 parser.add_argument('-q', '--nr_resnet', type=int, default=5, help='Number of residual blocks per stage of the model')
 parser.add_argument('-n', '--nr_filters', type=int, default=192, help='Number of filters to use across the model. Higher = larger model.')
 parser.add_argument('-m', '--nr_logistic_mix', type=int, default=10, help='Number of logistic components in the mixture. Higher = more flexible model')
@@ -98,28 +106,9 @@ else:
   new_x_gen = model(x_sample, ema=None, **model_opt)
   #new_x_gen = nn.sample_from_gaussian(new_x_gen)  
 def sample_from_model(sess):
-    if args.model == 'pixel_cnn':
-      x_gen = np.zeros((args.sample_batch_size,) + obs_shape, dtype=np.float32)
-      #assert len(obs_shape) == 3, 'assumed right now'
-      for yi in range(obs_shape[0]):
-        for xi in range(obs_shape[1]):
-          new_x_gen_np = sess.run(new_x_gen, {x_sample: x_gen})
-          x_gen[:,yi,xi,:] = new_x_gen_np[:,yi,xi,:].copy()
-      return x_gen
-    else:
-      x = np.linspace(0.,2.,num=args.sample_batch_size)
-      #print (x.shape)
-      xx = np.tile(x, [2, 1])
-      xx = np.transpose(xx)
-      #print (xx.shape)
-      new_x_gen_np = sess.run(new_x_gen, {x_sample:xx})
-      #print (x.shape)
-      #print (new_x_gen_np.shape)
-      #print (new_x_gen_np)
-      #print (x)
-      M = np.concatenate([np.reshape(x, [-1, 1]), np.reshape(new_x_gen_np, [-1, 1])], axis=1)
-      #print (M)
-      return M
+  x_gen = np.zeros((args.sample_batch_size,) + obs_shape, dtype=np.float32)
+  new_x_gen_np = sess.run(new_x_gen, {x_sample: x_gen})
+  return new_x_gen_np
 
 # get loss gradients over multiple GPUs
 xs = []
@@ -130,19 +119,14 @@ for i in range(args.nr_gpu):
     xs.append(tf.placeholder(tf.float32, shape=(args.batch_size, ) + obs_shape))
     with tf.device('/gpu:%d' % i):
         # train
-        gen_par = model(xs[i], ema=None, **model_opt)
-        loss_gen.append(nn.loss(xs[i], gen_par))
+        gen_par,jacs = model(xs[i], ema=None, **model_opt)
+        loss_gen.append(nn.loss(gen_par, jacs))
         # gradients
         grads.append(tf.gradients(loss_gen[i], all_params))
         # test
         model_opt_for_testing = model_opt
-        if args.model == 'pixel_cnn':
-          model_opt_for_testing['dropout_p'] = 0
-          gen_par = model(xs[i], ema=None, **model_opt_for_testing)
-          loss_gen_test.append(nn.loss(xs[i], gen_par))
-        else:
-          gen_par = model(xs[i], ema=None, **model_opt)
-          loss_gen_test.append(nn.loss(xs[i], gen_par))
+        gen_par,jacs = model(xs[i], ema=None, **model_opt)
+        loss_gen_test.append(nn.loss(gen_par, jacs))
 
 # add gradients together and get training updates
 tf_lr = tf.placeholder(tf.float32, shape=[])
@@ -165,10 +149,141 @@ saver = tf.train.Saver()
 
 # input to pixelCNN is scaled from uint8 [0,255] to float in range [-1,1]
 def prepro(x):
-  if args.model == 'pixel_cnn':
-    return np.cast[np.float32]((x - 127.5) / 127.5)
-  else:
-    return x
+  x[:,:,:,0] = 255.0
+  x[:,:,:,1] = np.random.uniform(0.0,0.5)*255.0
+  x[:,:,:,1] = 0.0
+  x[:,:,:,2] = 0.0
+
+  return np.cast[np.float32]((x - 127.5) / 127.5)
+
+def create_montage_image(images, height, width, n_row, n_col, n_channel):
+  images = images.reshape((n_row, n_col, height, width, n_channel))
+  images = images.transpose(0, 2, 1, 3, 4)
+  images = images.reshape((height * n_row, width * n_col, n_channel))
+  if n_channel == 1:
+    images = np.tile(images, (1,1,3))
+  return images
+
+
+def compute_likelihood(xf):
+  print ("computing likelihood of image with mean %f" % np.mean(xf))
+  xfs = np.split(xf, args.nr_gpu)
+  #print ("Splitting %d images into groups of size %d" % (xf.shape[0], xfs.shape[0]))
+  feed_dict = { xs[i]: xfs[i] for i in range(args.nr_gpu) }
+  l = sess.run(bits_per_dim_test, feed_dict)
+  return l
+
+# |x| is assumed to be in range [-1,1]
+# distortions is a dictinary of distortions
+def distort_images(x, distortions):
+  x = x*0.5 + 0.5
+  x = np.clip(x, 0.0, 1.0)
+  num_images = x.shape[0]
+  width = x.shape[1]
+  height = x.shape[2]
+  
+  distorted = np.copy(x)
+  
+  distorted = color.rgb2lab(distorted)
+  for i in range(num_images):
+    distorted[i,:,:,1] += distortions['tint_a']
+    distorted[i,:,:,2] += distortions['tint_b']
+    distorted[i] = color.lab2rgb(distorted[i])
+
+  distorted = color.rgb2lab(distorted)
+  distorted[:,:,:,1:3] *= distortions['saturation_scale']
+
+
+  for i in range(distorted.shape[0]):
+    distorted[i] = color.lab2rgb(distorted[i])
+
+      
+  distorted = 0.5 + (distorted - 0.5) * distortions['contrast_scale']
+  distorted = np.clip(distorted, 0.0, 1.0)
+      
+  
+  distorted += (np.random.randn(num_images,width,height,3)-0.5)*distortions['noise_scale']
+  distorted = np.clip(distorted, 0.0, 1.0)
+
+  
+
+  if distortions['apply_gradient'] == True:
+    top_color = np.array([0.0, 0.0, 0.0])
+    bottom_color = np.array([0.8, 0.2, 0.2])
+    height = distorted.shape[1]
+    for i in range(height):
+      grad_color = top_color * float(height - i) / height + bottom_color * float(i)/height
+      distorted[:,i,:,0] += grad_color[0]
+      distorted[:,i,:,1] += grad_color[1]
+      distorted[:,i,:,2] += grad_color[2]
+      distorted = np.clip(distorted,0.0,1.0)
+  
+  distorted = ndimage.filters.gaussian_filter(distorted, distortions['blur'])
+
+  if distortions['transform'] == True:
+    distorted[:4,:,:,:] = predict(distorted[:4,:,:,:], x[:4,:,:,:])
+    #sample_x = sample_from_model(sess)
+    #sample_x = np.tile(sample_x, (2, 1, 1, 1))
+    #distorted = distorted*0.5 + 0.5
+  
+  return (distorted - 0.5)*2.0
+
+
+def test_likelihoods(x):
+  #x = x[:4,:,:,:]
+  distortions = {}
+  distortions['tint_a'] = 0
+  distortions['tint_b'] = 0
+  distortions['saturation_scale'] = 1.0
+  distortions['contrast_scale'] = 1.0
+  distortions['noise_scale'] = 0.0
+  distortions['apply_gradient'] = False
+  distortions['blur'] = 0.0
+  distortions['transform'] = False
+  radius = 2
+  w = x.shape[1]
+  h = x.shape[2]
+  num_images_per_row = radius*2+1
+  nll_matrix = np.zeros((num_images_per_row,num_images_per_row))
+  for a in range(-radius,radius+1):
+    for b in range(-radius,radius+1):
+      #distortions['tint_a'] = a*4
+      #distortions['tint_b'] = b*4
+      distortions['saturation_scale'] = 1.0 + a*0.3
+      distortions['contrast_scale'] = 1.0 + b*0.3
+      #distortions['noise_scale'] = 0.03*a
+      #distortions['apply_gradient'] = True if b > 0 else False
+      #distortions['blur'] = 0.15 * (b + radius)
+      #distortions['transform'] = True if b > 0 else False            
+      images = distort_images(x, distortions)        
+      print ("distort_images changed images of batch size %d to %d" % (x.shape[0], images.shape[0]))
+      nll = compute_likelihood(images)
+      nll_matrix[a+radius,b+radius] = nll
+      print ("computing likelihood of (a,b)=(%d,%d) = %f..." % (a,b,nll))
+      images = (images*0.5 + 0.5)
+      images = images[:4,:,:,:]
+      montage = create_montage_image(images,w,h,2,2,3)
+      plt.subplot2grid((num_images_per_row+2,num_images_per_row),(a+radius,b+radius))
+      plt.axis('off')
+      plt.imshow(montage)
+      plt.title('%f' % nll)
+  
+  chart = plt.subplot2grid((num_images_per_row+2,num_images_per_row),(num_images_per_row,0), 
+                           colspan=num_images_per_row)
+  chart.plot(range(-radius, radius+1), nll_matrix)
+  plt.ylabel("nll")
+  plt.title("nll by the vertical axis")
+    
+
+  chart = plt.subplot2grid((num_images_per_row+2,num_images_per_row),(num_images_per_row+1,0), 
+                           colspan=num_images_per_row)
+  chart.plot(range(-radius, radius+1), np.transpose(nll_matrix))
+  plt.ylabel("nll")
+  plt.title("nll by the horizontal axis")
+
+
+  plt.savefig('test/test_contrast_and_saturation_%s.png' % time.strftime("%m_%d_%H_%M_%S"), bbox_inches='tight')
+
 
 # //////////// perform training //////////////
 if not os.path.exists(args.save_dir):
@@ -216,6 +331,7 @@ with tf.Session() as sess:
           print ("Testing...")
           for x in test_data:
             xf = prepro(x)
+            #test_likelihoods(xf)
             xfs = np.split(xf, args.nr_gpu)
             feed_dict = { xs[i]: xfs[i] for i in range(args.nr_gpu) }
             l = sess.run(bits_per_dim_test, feed_dict)
@@ -232,18 +348,12 @@ with tf.Session() as sess:
             print ("Generating samples...")
 
             # generate samples from the model
-            if args.model == 'pixel_cnn':
-              sample_x = sample_from_model(sess)
-              img_tile = plotting.img_tile(sample_x, aspect_ratio=1.0, border_color=1.0, stretch=True)
-              img = plotting.plot_img(img_tile, title=args.data_set + ' samples')
-              plotting.plt.savefig(os.path.join(args.save_dir,'%s_sample%d.png' % (args.data_set, epoch)))
-              plotting.plt.close('all')
-            else:
-              sample_x = sample_from_model(sess)
-              plt.clf()
-              plt.scatter(sample_x[:,0], sample_x[:,1])
-              plt.savefig("real_nvp_samples.png")
-
+            #sample_x = sample_from_model(sess)
+            #img_tile = plotting.img_tile(sample_x, aspect_ratio=1.0, border_color=1.0, stretch=True)
+            #img = plotting.plot_img(img_tile, title=args.data_set + ' samples')
+            #plotting.plt.savefig(os.path.join(args.save_dir,'%s_sample%d.png' % (args.data_set, epoch)))
+            #plotting.plt.close('all')
+            
             # save params
             saver.save(sess, args.save_dir + '/params_' + args.data_set + '.ckpt')
             np.savez(args.save_dir + '/test_bpd_' + args.data_set + '.npz', test_bpd=np.array(test_bpd))

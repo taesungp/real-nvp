@@ -7,8 +7,42 @@ import pixel_cnn_pp.scopes as scopes
 from pixel_cnn_pp.scopes import add_arg_scope
 import real_nvp.nn as nn
 
+
 @add_arg_scope
 def model_spec(x, init=True, ema=None):
+  counters = {}
+  with scopes.arg_scope([],counters=counters,init=init, ema=ema):
+    xs = nn.int_shape(x)
+    sum_log_det_jacobians = tf.zeros(xs[0])    
+    
+    # corrupt data (Tapani Raiko's dequantization)
+    y = x*0.5 + 0.5
+    y = y*255.0
+    corruption_level = 1.0
+    y = y + corruption_level * tf.random_uniform(xs)
+    y = y/(255.0 + corruption_level)
+    
+    #model logit instead of the x itself    
+    alpha = 1e-5
+    y = y*(1-alpha) + alpha*0.5
+    jac = tf.reduce_sum(-tf.log(y) - tf.log(1-y), [1,2,3])
+    y = tf.log(y) - tf.log(1-y)
+    sum_log_det_jacobians += jac
+
+    
+    # coupling layers
+    y,jac = nn.coupling_layer(y, 'checkerboard0', name='Coupling1')
+    sum_log_det_jacobians += jac
+
+    y,jac = nn.coupling_layer(y, 'checkerboard1', name='Coupling2')
+    sum_log_det_jacobians += jac
+
+    return y,sum_log_det_jacobians
+    
+  
+
+@add_arg_scope
+def simple_model_spec(x, init=True, ema=None):
   
   counters = {}
   with scopes.arg_scope([],counters=counters,init=init, ema=ema):
