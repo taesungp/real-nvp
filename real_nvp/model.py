@@ -8,36 +8,57 @@ from pixel_cnn_pp.scopes import add_arg_scope
 import real_nvp.nn as nn
 
 
+
+layers = []
+def construct_model_spec():
+  layers.append(nn.CouplingLayer('checkerboard0', name='Coupling1'))
+  layers.append(nn.CouplingLayer('checkerboard1', name='Coupling2'))    
+
+
 @add_arg_scope
 def model_spec(x, init=True, ema=None):
   counters = {}
-  with scopes.arg_scope([],counters=counters,init=init, ema=ema):
-    xs = nn.int_shape(x)
-    sum_log_det_jacobians = tf.zeros(xs[0])    
-    
-    # corrupt data (Tapani Raiko's dequantization)
-    y = x*0.5 + 0.5
-    y = y*255.0
-    corruption_level = 1.0
-    y = y + corruption_level * tf.random_uniform(xs)
-    y = y/(255.0 + corruption_level)
-    
-    #model logit instead of the x itself    
-    alpha = 1e-5
-    y = y*(1-alpha) + alpha*0.5
-    jac = tf.reduce_sum(-tf.log(y) - tf.log(1-y), [1,2,3])
-    y = tf.log(y) - tf.log(1-y)
-    sum_log_det_jacobians += jac
+  #with scopes.arg_scope([],counters=counters,init=init, ema=ema):
+  xs = nn.int_shape(x)
+  sum_log_det_jacobians = tf.zeros(xs[0])    
 
+  # corrupt data (Tapani Raiko's dequantization)
+  y = x*0.5 + 0.5
+  y = y*255.0
+  corruption_level = 1.0
+  y = y + corruption_level * tf.random_uniform(xs)
+  y = y/(255.0 + corruption_level)
+
+  #model logit instead of the x itself    
+  alpha = 1e-5
+  y = y*(1-alpha) + alpha*0.5
+  jac = tf.reduce_sum(-tf.log(y) - tf.log(1-y), [1,2,3])
+  y = tf.log(y) - tf.log(1-y)
+  sum_log_det_jacobians += jac
+
+  if len(layers) == 0:
+    construct_model_spec()
+
+  # construct forward pass    
+  for layer in layers:
+    y,jac = layer.coupling_layer(y)
+    sum_log_det_jacobians += jac        
+
+  return y,sum_log_det_jacobians
+
+def inv_model_spec(y):
+  # construct inverse pass for sampling
+  x = y
+  for layer in reversed(layers):
+    x = layer.inv_coupling_layer(x)
     
-    # coupling layers
-    y,jac = nn.coupling_layer(y, 'checkerboard0', name='Coupling1')
-    sum_log_det_jacobians += jac
+  # inverse logit
+  x = tf.inv(1 + tf.exp(-x))
 
-    y,jac = nn.coupling_layer(y, 'checkerboard1', name='Coupling2')
-    sum_log_det_jacobians += jac
+  # scale to [-1,1]
+  #x = (x-0.5)*2.0
 
-    return y,sum_log_det_jacobians
+  return x
     
   
 

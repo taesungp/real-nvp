@@ -30,9 +30,11 @@ import pixel_cnn_pp.plotting as plotting
 import pixel_cnn_pp.scopes as scopes
 from pixel_cnn_pp.model import model_spec as pixel_cnn_model_spec
 from real_nvp.model import model_spec as real_nvp_model_spec
+from real_nvp.model import inv_model_spec as real_nvp_inv_model_spec
 import data.cifar10_data as cifar10_data
 import data.imagenet_data as imagenet_data
 import data.csv_data as csv_data
+import util
 
 # -----------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
@@ -85,6 +87,7 @@ nn = {'pixel_cnn': pixel_cnn_nn,
 model_opt = {'pixel_cnn':{ 'nr_resnet': args.nr_resnet, 'nr_filters': args.nr_filters, 'nr_logistic_mix': args.nr_logistic_mix, 'dropout_p': args.dropout_p },
              'real_nvp':{}}[args.model]
 model = tf.make_template('model', model_spec)
+inv_model = tf.make_template('model', real_nvp_inv_model_spec, unique_name_='model')
 
 x_init = tf.placeholder(tf.float32, shape=(args.init_batch_size,) + obs_shape)
 # run once for data dependent initialization of parameters
@@ -97,16 +100,10 @@ maintain_averages_op = tf.group(ema.apply(all_params))
 
 # sample from the model
 x_sample = tf.placeholder(tf.float32, shape=(args.sample_batch_size, ) + obs_shape)
-model_opt_for_sampling = model_opt
-if args.model == 'pixel_cnn':
-  model_opt_for_sampling['dropout_p'] = 0
-  gen_par = model(x_sample, ema=None, **model_opt_for_sampling)
-  new_x_gen = nn.sample_from_discretized_mix_logistic(gen_par, args.nr_logistic_mix)
-else:
-  new_x_gen = model(x_sample, ema=None, **model_opt)
-  #new_x_gen = nn.sample_from_gaussian(new_x_gen)  
+new_x_gen = inv_model(x_sample)
+#new_x_gen = nn.sample_from_gaussian(new_x_gen)  
 def sample_from_model(sess):
-  x_gen = np.zeros((args.sample_batch_size,) + obs_shape, dtype=np.float32)
+  x_gen = np.random.normal(0.0, 1.0, (args.sample_batch_size,) + obs_shape)
   new_x_gen_np = sess.run(new_x_gen, {x_sample: x_gen})
   return new_x_gen_np
 
@@ -305,6 +302,9 @@ with tf.Session() as sess:
                 ckpt_file = args.save_dir + '/params_' + args.data_set + '.ckpt'
                 print('restoring parameters from', ckpt_file)
                 saver.restore(sess, ckpt_file)
+            util.show_all_variables()
+
+        
 
         # train for one epoch
         train_losses = []
@@ -348,11 +348,11 @@ with tf.Session() as sess:
             print ("Generating samples...")
 
             # generate samples from the model
-            #sample_x = sample_from_model(sess)
-            #img_tile = plotting.img_tile(sample_x, aspect_ratio=1.0, border_color=1.0, stretch=True)
-            #img = plotting.plot_img(img_tile, title=args.data_set + ' samples')
-            #plotting.plt.savefig(os.path.join(args.save_dir,'%s_sample%d.png' % (args.data_set, epoch)))
-            #plotting.plt.close('all')
+            sampled_x = sample_from_model(sess)
+            img_tile = plotting.img_tile(sampled_x, aspect_ratio=1.0, border_color=1.0, stretch=True)
+            img = plotting.plot_img(img_tile, title=args.data_set + ' samples')
+            plotting.plt.savefig(os.path.join(args.save_dir,'%s_sample%d.png' % (args.data_set, epoch)))
+            plotting.plt.close('all')
             
             # save params
             saver.save(sess, args.save_dir + '/params_' + args.data_set + '.ckpt')
