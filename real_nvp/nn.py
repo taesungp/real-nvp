@@ -28,23 +28,41 @@ class CouplingLayer(Layer):
   # returns l,m
   def function_l_m(self,x,mask,name='function_l_m'):
     with tf.variable_scope(name):
-      channel = 16
+      channel = 64
       padding = 'SAME'
       xs = int_shape(x)
       kernel_h = 3
       kernel_w = 3
       input_channel = xs[3]
+      y = x
 
-      weights_shape = [kernel_h, kernel_w, input_channel, channel]
-      weights = tf.get_variable("weights", weights_shape, tf.float32, 
-                            tf.contrib.layers.xavier_initializer())
-      y = tf.nn.conv2d(x, weights, [1, 1, 1, 1], padding=padding)
+      weights_shape = [1, 1, input_channel, channel]
+      weights = tf.get_variable("weights_input", weights_shape, tf.float32, 
+                                tf.contrib.layers.xavier_initializer())
+      y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)
       y = tf.nn.relu(y)
 
+      skip = y
+      num_residual_blocks = 8
+      for r in range(num_residual_blocks):        
+        weights_shape = [kernel_h, kernel_w, channel, channel]
+        weights = tf.get_variable("weights%d_1" % r, weights_shape, tf.float32, 
+                                  tf.contrib.layers.xavier_initializer())
+        y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)
+        y = tf.nn.relu(y)
+        weights_shape = [kernel_h, kernel_w, channel, channel]
+        weights = tf.get_variable("weights%d_2" % r, weights_shape, tf.float32, 
+                                  tf.contrib.layers.xavier_initializer())
+        y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)
+        y += skip
+        y = tf.nn.relu(y)
+        skip = y
+
+        
       weights = tf.get_variable("weights_output", [1, 1, channel, input_channel*2],
                                 tf.float32, tf.contrib.layers.xavier_initializer())
       y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)    
-
+        
       l = y[:,:,:,:input_channel] * (-mask+1)
       m = y[:,:,:,input_channel:] * (-mask+1)
 

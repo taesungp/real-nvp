@@ -151,7 +151,7 @@ def prepro(x):
   #x[:,:,:,1] = 0.0
   #x[:,:,:,2] = 0.0
 
-  x = np.random.uniform(0.0,1.0,(x.shape[0], 32, 32, 3))*255.0
+  #x = np.random.uniform(0.0,1.0,(x.shape[0], 32, 32, 3))*255.0
 
   return np.cast[np.float32]((x - 127.5) / 127.5)
 

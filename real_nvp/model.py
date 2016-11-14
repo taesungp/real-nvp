@@ -12,7 +12,7 @@ import real_nvp.nn as nn
 layers = []
 def construct_model_spec():
   global layers
-  for scale in range(2):
+  for scale in range(1):
     layers.append(nn.CouplingLayer('checkerboard0', name='Checkerboard%d_1' % scale))
     layers.append(nn.CouplingLayer('checkerboard1', name='Checkerboard%d_2' % scale))
     layers.append(nn.CouplingLayer('checkerboard0', name='Checkerboard%d_3' % scale))
