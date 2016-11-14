@@ -11,9 +11,26 @@ import real_nvp.nn as nn
 
 layers = []
 def construct_model_spec():
-  layers.append(nn.CouplingLayer('checkerboard0', name='Coupling1'))
-  layers.append(nn.CouplingLayer('checkerboard1', name='Coupling2'))    
+  global layers
+  for scale in range(2):
+    layers.append(nn.CouplingLayer('checkerboard0', name='Checkerboard%d_1' % scale))
+    layers.append(nn.CouplingLayer('checkerboard1', name='Checkerboard%d_2' % scale))
+    layers.append(nn.CouplingLayer('checkerboard0', name='Checkerboard%d_3' % scale))
+    layers.append(nn.SqueezingLayer(name='Squeeze%d' % scale))
+    layers.append(nn.CouplingLayer('channel0', name='Channel%d_1' % scale))
+    layers.append(nn.CouplingLayer('channel1', name='Channel%d_2' % scale))
+    layers.append(nn.CouplingLayer('channel0', name='Channel%d_3' % scale))
 
+  # final layer
+  scale = 2
+  layers.append(nn.CouplingLayer('checkerboard0', use_batchnorm=False, name='Checkerboard%d_1' % scale))
+  layers.append(nn.CouplingLayer('checkerboard1', use_batchnorm=False, name='Checkerboard%d_2' % scale))
+  layers.append(nn.CouplingLayer('checkerboard0', use_batchnorm=False, name='Checkerboard%d_3' % scale))
+  layers.append(nn.CouplingLayer('checkerboard1', use_batchnorm=False, name='Checkerboard%d_4' % scale))
+
+
+  
+final_latent_dimension = []
 
 @add_arg_scope
 def model_spec(x, init=True, ema=None):
@@ -41,22 +58,25 @@ def model_spec(x, init=True, ema=None):
 
   # construct forward pass    
   for layer in layers:
-    y,jac = layer.coupling_layer(y)
-    sum_log_det_jacobians += jac        
+    y,jac = layer.forward_and_jacobian(y, jac)
 
-  return y,sum_log_det_jacobians
+  # record dimension of the final variable
+  global final_latent_dimension
+  final_latent_dimension = nn.int_shape(y)
+
+  return y,jac
 
 def inv_model_spec(y):
   # construct inverse pass for sampling
-  x = y
+  shape = final_latent_dimension
+  y = tf.reshape(y, [-1, shape[1], shape[2], shape[3]])
   for layer in reversed(layers):
-    x = layer.inv_coupling_layer(x)
+    y = layer.backward(y)
     
+  x = y
+
   # inverse logit
   x = tf.inv(1 + tf.exp(-x))
-
-  # scale to [-1,1]
-  #x = (x-0.5)*2.0
 
   return x
     

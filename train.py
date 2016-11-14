@@ -95,8 +95,8 @@ gen_par = model(x_init, init=True, **model_opt)
 
 # keep track of moving average
 all_params = tf.trainable_variables()
-ema = tf.train.ExponentialMovingAverage(decay=args.polyak_decay)
-maintain_averages_op = tf.group(ema.apply(all_params))
+#ema = tf.train.ExponentialMovingAverage(decay=args.polyak_decay)
+#maintain_averages_op = tf.group(ema.apply(all_params))
 
 # sample from the model
 x_sample = tf.placeholder(tf.float32, shape=(args.sample_batch_size, ) + obs_shape)
@@ -146,10 +146,12 @@ saver = tf.train.Saver()
 
 # input to pixelCNN is scaled from uint8 [0,255] to float in range [-1,1]
 def prepro(x):
-  x[:,:,:,0] = 255.0
-  x[:,:,:,1] = np.random.uniform(0.0,0.5)*255.0
-  x[:,:,:,1] = 0.0
-  x[:,:,:,2] = 0.0
+  #x[:,:,:,0] = 255.0
+  #x[:,:,:,1] = np.random.uniform(0.0,0.5)*255.0
+  #x[:,:,:,1] = 0.0
+  #x[:,:,:,2] = 0.0
+
+  x = np.random.uniform(0.0,1.0,(x.shape[0], 32, 32, 3))*255.0
 
   return np.cast[np.float32]((x - 127.5) / 127.5)
 

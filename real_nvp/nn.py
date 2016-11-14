@@ -4,11 +4,25 @@ import tensorflow as tf
 def int_shape(x):
     return list(map(int, x.get_shape()))
 
+class Layer():
+  def forward_and_jacobian(self, x, sum_log_det_jacobians):
+    raise NotImplementedError(str(type(self)))
 
-class CouplingLayer():
-  def __init__(self, mask_type, name='Coupling'):
+  def backward(self, y):
+    raise NotImplementedError(str(type(self)))
+
+class CouplingLayer(Layer):
+  def __init__(self, mask_type, use_batchnorm = True, name='Coupling'):
     self.mask_type = mask_type
     self.name = name
+
+    # for batch normalization using moving average
+    self.use_batchnorm = True
+    self.mu_l = tf.zeros([1], name=name+"/mu_l")
+    self.sig2_l = tf.ones([1], name=name+"/sig2_l")
+    self.mu_m = tf.zeros([1], name=name+"/mu_m")
+    self.sig2_m = tf.ones([1], name=name+"/sig2_m")
+    self.momentum = 0.5
   
   # corresponds to the function m and l in the RealNVP paper
   # returns l,m
@@ -34,6 +48,24 @@ class CouplingLayer():
       l = y[:,:,:,:input_channel] * (-mask+1)
       m = y[:,:,:,input_channel:] * (-mask+1)
 
+      # batch normalization with moving average (Appendix E of the paper)
+      if self.use_batchnorm:
+        self.mu_l = tf.reduce_mean(l)
+        self.mu_m = tf.reduce_mean(m)
+        self.sig2_l = tf.reduce_mean(tf.square(l-self.mu_l))
+        self.sig2_m = tf.reduce_mean(tf.square(m-self.mu_m))
+        # self.mu_l = self.mu_l * self.momentum + mu_l * (1.0 - self.momentum)
+        # self.mu_m = self.mu_m * self.momentum + mu_m * (1.0 - self.momentum)
+        # self.sig2_l = self.sig2_l * self.momentum + sig2_l * (1.0 - self.momentum)
+        # self.sig2_m = self.sig2_m * self.momentum + sig2_m * (1.0 - self.momentum)
+        # l = (l - self.mu_l) / tf.sqrt(self.sig2_l + 1e-5)
+        # m = (m - self.mu_m) / tf.sqrt(self.sig2_m + 1e-5)
+        
+        l = (l - self.mu_l) / tf.sqrt(self.sig2_l + 1e-5) / 10
+        m = (m - self.mu_m) / tf.sqrt(self.sig2_m + 1e-5) 
+      else:
+        l = l*0.1 # for numerical stability
+      
       return l,m
 
 
@@ -48,18 +80,24 @@ class CouplingLayer():
       unit1 = -unit0 + 1.0
       unit = unit0 if mask_type == 'checkerboard0' else unit1
       unit = tf.reshape(unit, [1, 2, 2, 1])
+      b = tf.tile(unit, [xs[0], xs[1]//2, xs[2]//2, xs[3]])
+    elif 'channel' in mask_type:
+      white = tf.ones([xs[0], xs[1], xs[2], xs[3]//2])
+      black = tf.zeros([xs[0], xs[1], xs[2], xs[3]//2])
+      if mask_type == 'channel0':
+        b = tf.concat(3, [white, black])
+      else:
+        b = tf.concat(3, [black, white])
 
-    b = tf.tile(unit, [xs[0], xs[1]//2, xs[2]//2, xs[3]])
-
-    assert 'checkerboard' in mask_type
-
+    bs = int_shape(b)
+    assert bs == xs
 
     return b
 
   # corresponds to the coupling layer of the RealNVP paper
   # |mask_type| can be 'checkerboard0', 'checkerboard1', 'channel0', 'channel1'
   # log_det_jacobian is a 1D tensor of size (batch_size)
-  def coupling_layer(self, x):
+  def forward_and_jacobian(self, x, sum_log_det_jacobians):
     with tf.variable_scope(self.name):
       xs = int_shape(x)
       b = self.get_mask(xs, self.mask_type)
@@ -69,10 +107,12 @@ class CouplingLayer():
       l,m = self.function_l_m(x1, b)
       y = x1 + tf.mul(-b+1.0, x*tf.check_numerics(tf.exp(l), "exp has NaN") + m)
       log_det_jacobian = tf.check_numerics(tf.reduce_sum(l, [1,2,3]), "l has NaN")
+      #log_det_jacobian += xs[1]*xs[2]*xs[3]*0.5*tf.log(tf.sqrt(self.sig2_l + 1e-5)*10)
+      sum_log_det_jacobians += log_det_jacobian
 
-      return y,log_det_jacobian
+      return y,sum_log_det_jacobians
 
-  def inv_coupling_layer(self, y):    
+  def backward(self, y):    
     with tf.variable_scope(self.name, reuse=True):
       ys = int_shape(y)
       b = self.get_mask(ys, self.mask_type)
@@ -81,6 +121,26 @@ class CouplingLayer():
       l,m = self.function_l_m(y1, b)
       x = y1 + tf.mul( y*(-b+1.0) - m, tf.exp(-l))
       return x
+
+class SqueezingLayer(Layer):
+  def __init__(self, name="Squeeze"):
+    self.name = name
+
+  def forward_and_jacobian(self, x, sum_log_det_jacobians):
+    xs = int_shape(x)
+    assert xs[1] % 2 == 0 and xs[2] % 2 == 0
+    y = tf.reshape(x, [xs[0], xs[1]//2, xs[2]//2, xs[3]*4])
+
+    return y,sum_log_det_jacobians
+
+  def backward(self, y):
+    ys = int_shape(y)
+    assert ys[3] % 4 == 0
+    x = tf.reshape(y, [ys[0], ys[1]*2, ys[2]*2, ys[3]//4])
+
+    return x
+
+
 
 # Given the output of the network and all jacobians, 
 # compute the log probability. 
@@ -91,7 +151,6 @@ def compute_log_prob_x(z, sum_log_det_jacobians):
   # 1/sqrt(2*pi)*exp(-0.5*x^2)
   zs = int_shape(z)
   K = zs[1]*zs[2]*zs[3] #dimension of the Gaussian distribution
-  print (0.5*K*np.log(2*np.pi))
 
   log_density_z = -0.5*tf.reduce_sum(tf.square(z), [1,2,3]) - 0.5*K*np.log(2*np.pi)
 
