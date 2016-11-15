@@ -27,7 +27,7 @@ class CouplingLayer(Layer):
   def batch_norm(self, x):
     mu = tf.reduce_mean(x)
     sig2 = tf.reduce_mean(tf.square(x-mu))
-    x = (x-mu)/tf.sqrt(sig2+ 1e-5)*0.1
+    x = (x-mu)/tf.sqrt(sig2+ 1e-5)
     return x
 
   
@@ -81,6 +81,8 @@ class CouplingLayer(Layer):
       l = y[:,:,:,:input_channel] * (-mask+1)
       m = y[:,:,:,input_channel:] * (-mask+1)
 
+      # for numerical stability
+      #l = tf.minimum(l, 100.0)
       
       return l,m
 
