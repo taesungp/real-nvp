@@ -15,17 +15,17 @@ def construct_model_spec():
   for scale in range(1):
     layers.append(nn.CouplingLayer('checkerboard0', name='Checkerboard%d_1' % scale))
     layers.append(nn.CouplingLayer('checkerboard1', name='Checkerboard%d_2' % scale))
-    layers.append(nn.CouplingLayer('checkerboard0', name='Checkerboard%d_3' % scale))
+    #layers.append(nn.CouplingLayer('checkerboard0', name='Checkerboard%d_3' % scale))
     layers.append(nn.SqueezingLayer(name='Squeeze%d' % scale))
-    layers.append(nn.CouplingLayer('channel0', name='Channel%d_1' % scale))
-    layers.append(nn.CouplingLayer('channel1', name='Channel%d_2' % scale))
-    layers.append(nn.CouplingLayer('channel0', name='Channel%d_3' % scale))
+    #layers.append(nn.CouplingLayer('channel0', name='Channel%d_1' % scale))
+    #layers.append(nn.CouplingLayer('channel1', name='Channel%d_2' % scale))
+    #layers.append(nn.CouplingLayer('channel0', name='Channel%d_3' % scale))
 
   # final layer
   scale = 2
-  layers.append(nn.CouplingLayer('checkerboard0', use_batchnorm=False, name='Checkerboard%d_1' % scale))
-  layers.append(nn.CouplingLayer('checkerboard1', use_batchnorm=False, name='Checkerboard%d_2' % scale))
-  layers.append(nn.CouplingLayer('checkerboard0', use_batchnorm=False, name='Checkerboard%d_3' % scale))
+  #layers.append(nn.CouplingLayer('checkerboard0', use_batchnorm=True, name='Checkerboard%d_1' % scale))
+  #layers.append(nn.CouplingLayer('checkerboard1', use_batchnorm=True, name='Checkerboard%d_2' % scale))
+  layers.append(nn.CouplingLayer('checkerboard0', use_batchnorm=True, name='Checkerboard%d_3' % scale))
   layers.append(nn.CouplingLayer('checkerboard1', use_batchnorm=False, name='Checkerboard%d_4' % scale))
 
 

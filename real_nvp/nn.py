@@ -17,12 +17,19 @@ class CouplingLayer(Layer):
     self.name = name
 
     # for batch normalization using moving average
-    self.use_batchnorm = True
+    self.use_batchnorm = use_batchnorm
     self.mu_l = tf.zeros([1], name=name+"/mu_l")
     self.sig2_l = tf.ones([1], name=name+"/sig2_l")
     self.mu_m = tf.zeros([1], name=name+"/mu_m")
     self.sig2_m = tf.ones([1], name=name+"/sig2_m")
     self.momentum = 0.5
+
+  def batch_norm(self, x):
+    mu = tf.reduce_mean(x)
+    sig2 = tf.reduce_mean(tf.square(x-mu))
+    x = (x-mu)/tf.sqrt(sig2+ 1e-5)*0.1
+    return x
+
   
   # corresponds to the function m and l in the RealNVP paper
   # returns l,m
@@ -40,6 +47,7 @@ class CouplingLayer(Layer):
       weights = tf.get_variable("weights_input", weights_shape, tf.float32, 
                                 tf.contrib.layers.xavier_initializer())
       y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)
+      y = self.batch_norm(y)
       y = tf.nn.relu(y)
 
       skip = y
@@ -49,11 +57,13 @@ class CouplingLayer(Layer):
         weights = tf.get_variable("weights%d_1" % r, weights_shape, tf.float32, 
                                   tf.contrib.layers.xavier_initializer())
         y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)
+        y = self.batch_norm(y)
         y = tf.nn.relu(y)
         weights_shape = [kernel_h, kernel_w, channel, channel]
         weights = tf.get_variable("weights%d_2" % r, weights_shape, tf.float32, 
                                   tf.contrib.layers.xavier_initializer())
         y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)
+        y = self.batch_norm(y)
         y += skip
         y = tf.nn.relu(y)
         skip = y
@@ -62,27 +72,15 @@ class CouplingLayer(Layer):
       weights = tf.get_variable("weights_output", [1, 1, channel, input_channel*2],
                                 tf.float32, tf.contrib.layers.xavier_initializer())
       y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)    
+
+      if self.use_batchnorm:
+        y = self.batch_norm(y)
+      else:
+        y = y*0.1
         
       l = y[:,:,:,:input_channel] * (-mask+1)
       m = y[:,:,:,input_channel:] * (-mask+1)
 
-      # batch normalization with moving average (Appendix E of the paper)
-      if self.use_batchnorm:
-        self.mu_l = tf.reduce_mean(l)
-        self.mu_m = tf.reduce_mean(m)
-        self.sig2_l = tf.reduce_mean(tf.square(l-self.mu_l))
-        self.sig2_m = tf.reduce_mean(tf.square(m-self.mu_m))
-        # self.mu_l = self.mu_l * self.momentum + mu_l * (1.0 - self.momentum)
-        # self.mu_m = self.mu_m * self.momentum + mu_m * (1.0 - self.momentum)
-        # self.sig2_l = self.sig2_l * self.momentum + sig2_l * (1.0 - self.momentum)
-        # self.sig2_m = self.sig2_m * self.momentum + sig2_m * (1.0 - self.momentum)
-        # l = (l - self.mu_l) / tf.sqrt(self.sig2_l + 1e-5)
-        # m = (m - self.mu_m) / tf.sqrt(self.sig2_m + 1e-5)
-        
-        l = (l - self.mu_l) / tf.sqrt(self.sig2_l + 1e-5) / 10
-        m = (m - self.mu_m) / tf.sqrt(self.sig2_m + 1e-5) 
-      else:
-        l = l*0.1 # for numerical stability
       
       return l,m
 
@@ -147,14 +145,16 @@ class SqueezingLayer(Layer):
   def forward_and_jacobian(self, x, sum_log_det_jacobians):
     xs = int_shape(x)
     assert xs[1] % 2 == 0 and xs[2] % 2 == 0
-    y = tf.reshape(x, [xs[0], xs[1]//2, xs[2]//2, xs[3]*4])
+    #y = tf.reshape(x, [xs[0], xs[1]//2, xs[2]//2, xs[3]*4])
+    y = tf.space_to_depth(x, 2)
 
     return y,sum_log_det_jacobians
 
   def backward(self, y):
     ys = int_shape(y)
     assert ys[3] % 4 == 0
-    x = tf.reshape(y, [ys[0], ys[1]*2, ys[2]*2, ys[3]//4])
+    #x = tf.reshape(y, [ys[0], ys[1]*2, ys[2]*2, ys[3]//4])
+    x = tf.depth_to_space(y,2)
 
     return x
 
