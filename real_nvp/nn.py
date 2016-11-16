@@ -5,13 +5,16 @@ def int_shape(x):
     return list(map(int, x.get_shape()))
 
 class Layer():
-  def forward_and_jacobian(self, x, sum_log_det_jacobians):
+  def forward_and_jacobian(self, x, sum_log_det_jacobians, z):
     raise NotImplementedError(str(type(self)))
 
-  def backward(self, y):
+  def backward(self, y, z):
     raise NotImplementedError(str(type(self)))
 
 class CouplingLayer(Layer):
+
+  # |use_batchnorm|: whether using batch norm at the very output of l,m.
+  # Batchnorm is used for all other convolutions regardless of this flag
   def __init__(self, mask_type, use_batchnorm = True, name='Coupling'):
     self.mask_type = mask_type
     self.name = name
@@ -26,8 +29,8 @@ class CouplingLayer(Layer):
 
   def batch_norm(self, x):
     mu = tf.reduce_mean(x)
-    sig2 = tf.reduce_mean(tf.square(x-mu))
-    x = (x-mu)/tf.sqrt(sig2+ 1e-5)
+    sig2 = tf.reduce_mean(tf.square(x-mu))    
+    x = (x-mu)/tf.sqrt(sig2 + 1.0)
     return x
 
   
@@ -43,6 +46,7 @@ class CouplingLayer(Layer):
       input_channel = xs[3]
       y = x
 
+      y = self.batch_norm(y)
       weights_shape = [1, 1, input_channel, channel]
       weights = tf.get_variable("weights_input", weights_shape, tf.float32, 
                                 tf.contrib.layers.xavier_initializer())
@@ -73,16 +77,17 @@ class CouplingLayer(Layer):
                                 tf.float32, tf.contrib.layers.xavier_initializer())
       y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)    
 
-      if self.use_batchnorm:
-        y = self.batch_norm(y)
-      else:
-        y = y*0.1
-        
+      #if self.use_batchnorm:
+      #  y = self.batch_norm(y)
+      #else:
+      y = y*0.1
+
       l = y[:,:,:,:input_channel] * (-mask+1)
       m = y[:,:,:,input_channel:] * (-mask+1)
 
-      # for numerical stability
-      #l = tf.minimum(l, 100.0)
+      #if not self.use_batchnorm:
+      #  l = tf.minimum(l, 10)
+
       
       return l,m
 
@@ -115,7 +120,7 @@ class CouplingLayer(Layer):
   # corresponds to the coupling layer of the RealNVP paper
   # |mask_type| can be 'checkerboard0', 'checkerboard1', 'channel0', 'channel1'
   # log_det_jacobian is a 1D tensor of size (batch_size)
-  def forward_and_jacobian(self, x, sum_log_det_jacobians):
+  def forward_and_jacobian(self, x, sum_log_det_jacobians, z):
     with tf.variable_scope(self.name):
       xs = int_shape(x)
       b = self.get_mask(xs, self.mask_type)
@@ -128,9 +133,9 @@ class CouplingLayer(Layer):
       #log_det_jacobian += xs[1]*xs[2]*xs[3]*0.5*tf.log(tf.sqrt(self.sig2_l + 1e-5)*10)
       sum_log_det_jacobians += log_det_jacobian
 
-      return y,sum_log_det_jacobians
+      return y,sum_log_det_jacobians, z
 
-  def backward(self, y):    
+  def backward(self, y, z):    
     with tf.variable_scope(self.name, reuse=True):
       ys = int_shape(y)
       b = self.get_mask(ys, self.mask_type)
@@ -138,27 +143,77 @@ class CouplingLayer(Layer):
       y1 = y * b
       l,m = self.function_l_m(y1, b)
       x = y1 + tf.mul( y*(-b+1.0) - m, tf.exp(-l))
-      return x
+      return x, z
 
 class SqueezingLayer(Layer):
   def __init__(self, name="Squeeze"):
     self.name = name
 
-  def forward_and_jacobian(self, x, sum_log_det_jacobians):
+  def forward_and_jacobian(self, x, sum_log_det_jacobians, z):
     xs = int_shape(x)
     assert xs[1] % 2 == 0 and xs[2] % 2 == 0
     #y = tf.reshape(x, [xs[0], xs[1]//2, xs[2]//2, xs[3]*4])
     y = tf.space_to_depth(x, 2)
+    if z is not None:
+      z = tf.space_to_depth(z, 2)      
 
-    return y,sum_log_det_jacobians
+    return y,sum_log_det_jacobians, z
 
-  def backward(self, y):
+  def backward(self, y, z):
     ys = int_shape(y)
     assert ys[3] % 4 == 0
     #x = tf.reshape(y, [ys[0], ys[1]*2, ys[2]*2, ys[3]//4])
     x = tf.depth_to_space(y,2)
 
-    return x
+    if z is not None:
+      z = tf.depth_to_space(z,2)
+
+    return x, z
+
+class FactorOutLayer(Layer):
+  def __init__(self, scale, name='FactorOut'):
+    self.scale = scale
+    self.name = name
+  
+  def forward_and_jacobian(self, x, sum_log_det_jacobians, z):
+
+    xs = int_shape(x)
+    split = xs[3]//2
+
+    new_z = x[:,:,:,:split]
+    x = x[:,:,:,split:]
+
+    if z is not None:
+      z = tf.concat(3, [z, new_z])
+    else:
+      z = new_z
+    
+    return x, sum_log_det_jacobians, z
+  
+  def backward(self, y, z):
+
+    # At scale 0, 1/2 of the original dimensions are factored out
+    # At scale 1, 1/4 of the original dimensions are factored out
+    # ....
+    # At scale s, (1/2)^(s+1) are factored out
+    # Hence, at backward pass of scale s, (1/2)^(s) of z should be factored in
+    
+    zs = int_shape(z)
+    split = zs[3] // (2**self.scale)
+    new_y = z[:,:,:,-split:]
+    z = z[:,:,:,:-split]
+
+    assert (int_shape(new_y)[3] == split)
+
+    if y is not None:
+      x = tf.concat(3, [new_y, y])
+    else:
+      x = new_y
+
+    return x, z
+            
+    
+    
 
 
 
@@ -172,9 +227,10 @@ def compute_log_prob_x(z, sum_log_det_jacobians):
   zs = int_shape(z)
   K = zs[1]*zs[2]*zs[3] #dimension of the Gaussian distribution
 
-  log_density_z = -0.5*tf.reduce_sum(tf.square(z), [1,2,3]) - 0.5*K*np.log(2*np.pi)
+  log_density_z = -0.5*tf.reduce_sum(tf.check_numerics(tf.square(z), "square z"), [1,2,3]) - 0.5*K*np.log(2*np.pi)
 
-  log_density_x = log_density_z + sum_log_det_jacobians
+  log_density_x = tf.check_numerics(log_density_z, "log_density_z") + \
+                  tf.check_numerics(sum_log_det_jacobians, "sum_log_det_jacobians")
 
   # to go from density to probability, one can 
   # multiply the density by the width of the 

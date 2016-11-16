@@ -12,22 +12,24 @@ import real_nvp.nn as nn
 layers = []
 def construct_model_spec():
   global layers
-  for scale in range(1):
-    pass
-    #layers.append(nn.CouplingLayer('checkerboard0', name='Checkerboard%d_1' % scale))
-    #layers.append(nn.CouplingLayer('checkerboard1', name='Checkerboard%d_2' % scale))
-    #layers.append(nn.CouplingLayer('checkerboard0', name='Checkerboard%d_3' % scale))
-    #layers.append(nn.SqueezingLayer(name='Squeeze%d' % scale))
-    #layers.append(nn.CouplingLayer('channel0', name='Channel%d_1' % scale))
-    #layers.append(nn.CouplingLayer('channel1', name='Channel%d_2' % scale))
-    #layers.append(nn.CouplingLayer('channel0', name='Channel%d_3' % scale))
+  num_scales = 2
+  for scale in range(num_scales-1):    
+    layers.append(nn.CouplingLayer('checkerboard0', name='Checkerboard%d_1' % scale))
+    layers.append(nn.CouplingLayer('checkerboard1', name='Checkerboard%d_2' % scale))
+    layers.append(nn.CouplingLayer('checkerboard0', name='Checkerboard%d_3' % scale))
+    layers.append(nn.SqueezingLayer(name='Squeeze%d' % scale))
+    layers.append(nn.CouplingLayer('channel0', name='Channel%d_1' % scale))
+    layers.append(nn.CouplingLayer('channel1', name='Channel%d_2' % scale))
+    layers.append(nn.CouplingLayer('channel0', use_batchnorm=True, name='Channel%d_3' % scale))
+    layers.append(nn.FactorOutLayer(scale, name='FactorOut%d' % scale))
 
   # final layer
-  scale = 2
+  scale = num_scales-1
   layers.append(nn.CouplingLayer('checkerboard0', use_batchnorm=True, name='Checkerboard%d_1' % scale))
   layers.append(nn.CouplingLayer('checkerboard1', use_batchnorm=True, name='Checkerboard%d_2' % scale))
   layers.append(nn.CouplingLayer('checkerboard0', use_batchnorm=True, name='Checkerboard%d_3' % scale))
-  layers.append(nn.CouplingLayer('checkerboard1', use_batchnorm=False, name='Checkerboard%d_4' % scale))
+  layers.append(nn.CouplingLayer('checkerboard1', use_batchnorm=True, name='Checkerboard%d_4' % scale))
+  layers.append(nn.FactorOutLayer(scale, name='FactorOut%d' % scale))
 
 
   
@@ -58,21 +60,25 @@ def model_spec(x, init=True, ema=None):
     construct_model_spec()
 
   # construct forward pass    
+  z = None
   for layer in layers:
-    y,jac = layer.forward_and_jacobian(y, jac)
+    y,jac,z = layer.forward_and_jacobian(y, jac, z)
+
+  z = tf.concat(3, [z,y])
 
   # record dimension of the final variable
   global final_latent_dimension
-  final_latent_dimension = nn.int_shape(y)
+  final_latent_dimension = nn.int_shape(z)
 
-  return y,jac
+  return z,jac
 
 def inv_model_spec(y):
   # construct inverse pass for sampling
   shape = final_latent_dimension
-  y = tf.reshape(y, [-1, shape[1], shape[2], shape[3]])
+  z = tf.reshape(y, [-1, shape[1], shape[2], shape[3]])
+  y = None
   for layer in reversed(layers):
-    y = layer.backward(y)
+    y,z = layer.backward(y,z)
     
   x = y
 

@@ -146,10 +146,10 @@ saver = tf.train.Saver()
 
 # input to pixelCNN is scaled from uint8 [0,255] to float in range [-1,1]
 def prepro(x):
-  x[:,:,:,0] = 255.0
+  #x[:,:,:,0] = 255.0
   #x[:,:,:,1] = np.random.uniform(0.0,0.5)*255.0
-  x[:,:,:,1] = 0.0
-  x[:,:,:,2] = 0.0
+  #x[:,:,:,1] = 0.0
+  #x[:,:,:,2] = 0.0
 
   #x = np.random.uniform(0.0,1.0,(x.shape[0], 32, 32, 3))*255.0
 
