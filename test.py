@@ -21,7 +21,8 @@ import datetime
 import dateutil.tz
 import scipy.misc
 from scipy import misc,ndimage
-
+from skimage import io, color
+import time
 
 import pixel_cnn_pp.nn as pixel_cnn_nn
 import real_nvp.nn as real_nvp_nn
@@ -29,12 +30,11 @@ import pixel_cnn_pp.plotting as plotting
 import pixel_cnn_pp.scopes as scopes
 from pixel_cnn_pp.model import model_spec as pixel_cnn_model_spec
 from real_nvp.model import model_spec as real_nvp_model_spec
+from real_nvp.model import inv_model_spec as real_nvp_inv_model_spec
 import data.cifar10_data as cifar10_data
 import data.imagenet_data as imagenet_data
 import data.csv_data as csv_data
-from skimage import io, color
-import time
-
+import util
 
 # -----------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
@@ -42,14 +42,19 @@ parser = argparse.ArgumentParser()
 parser.add_argument('-i', '--data_dir', type=str, default='/tmp/pxpp/data', help='Location for the dataset')
 parser.add_argument('-o', '--save_dir', type=str, default='/tmp/pxpp/save', help='Location for parameter checkpoints and samples')
 parser.add_argument('-d', '--data_set', type=str, default='cifar', help='Can be either cifar|imagenet')
+parser.add_argument('-t', '--save_interval', type=int, default=20, help='Every how many epochs to write checkpoint/samples?')
+parser.add_argument('-r', '--load_params', type=int, default=0, help='Restore training from previous model checkpoint? 1 = Yes, 0 = No')
 # model
-parser.add_argument('--model', type=str, default='pixel_cnn', help='model name: pixel_cnn, real_nvp')
+parser.add_argument('--model', type=str, default='real_nvp', help='model name: pixel_cnn, real_nvp')
 parser.add_argument('-q', '--nr_resnet', type=int, default=5, help='Number of residual blocks per stage of the model')
 parser.add_argument('-n', '--nr_filters', type=int, default=192, help='Number of filters to use across the model. Higher = larger model.')
 parser.add_argument('-m', '--nr_logistic_mix', type=int, default=10, help='Number of logistic components in the mixture. Higher = more flexible model')
 # optimization
+parser.add_argument('-l', '--learning_rate', type=float, default=0.001, help='Base learning rate')
+parser.add_argument('-e', '--lr_decay', type=float, default=0.999995, help='Learning rate decay, applied every step of the optimization')
 parser.add_argument('-b', '--batch_size', type=int, default=12, help='Batch size during training per GPU')
 parser.add_argument('-a', '--init_batch_size', type=int, default=100, help='How much data to use for data-dependent initialization.')
+parser.add_argument('-p', '--dropout_p', type=float, default=0.5, help='Dropout strength (i.e. 1 - keep_prob). 0 = No dropout, higher = more dropout.')
 parser.add_argument('-x', '--max_epochs', type=int, default=5000, help='How many epochs to run in total?')
 parser.add_argument('-g', '--nr_gpu', type=int, default=8, help='How many GPUs to distribute the training across?')
 # evaluation
@@ -79,9 +84,10 @@ nn = {'pixel_cnn': pixel_cnn_nn,
       'real_nvp': real_nvp_nn}[args.model]
 
 # create the model
-model_opt = {'pixel_cnn':{ 'nr_resnet': args.nr_resnet, 'nr_filters': args.nr_filters, 'nr_logistic_mix': args.nr_logistic_mix, 'dropout_p': 0.0 },
+model_opt = {'pixel_cnn':{ 'nr_resnet': args.nr_resnet, 'nr_filters': args.nr_filters, 'nr_logistic_mix': args.nr_logistic_mix, 'dropout_p': args.dropout_p },
              'real_nvp':{}}[args.model]
 model = tf.make_template('model', model_spec)
+inv_model = tf.make_template('model', real_nvp_inv_model_spec, unique_name_='model')
 
 x_init = tf.placeholder(tf.float32, shape=(args.init_batch_size,) + obs_shape)
 # run once for data dependent initialization of parameters
@@ -89,74 +95,87 @@ gen_par = model(x_init, init=True, **model_opt)
 
 # keep track of moving average
 all_params = tf.trainable_variables()
-ema = tf.train.ExponentialMovingAverage(decay=args.polyak_decay)
-maintain_averages_op = tf.group(ema.apply(all_params))
+#ema = tf.train.ExponentialMovingAverage(decay=args.polyak_decay)
+#maintain_averages_op = tf.group(ema.apply(all_params))
 
-# sample from the model
-x_sample = tf.placeholder(tf.float32, shape=(args.sample_batch_size, ) + obs_shape)
-x_bias = tf.placeholder(tf.float32, shape=(args.sample_batch_size, ) + obs_shape)
-if args.model == 'pixel_cnn':
-  gen_par = model(x_sample, ema=None, **model_opt)
-  new_x_gen = nn.sample_from_discretized_mix_logistic(gen_par, args.nr_logistic_mix)
-  new_x_gen_biased = nn.sample_from_discretized_mix_logistic(gen_par, args.nr_logistic_mix, 
-                                                             bias = x_bias)
-else:
-  new_x_gen = model(x_sample, ema=None, **model_opt)
-  #new_x_gen = nn.sample_from_gaussian(new_x_gen)  
-def sample_from_model(sess):
-    if args.model == 'pixel_cnn':
-      x_gen = np.zeros((args.sample_batch_size,) + obs_shape, dtype=np.float32)
-      #assert len(obs_shape) == 3, 'assumed right now'
-      for yi in range(obs_shape[0]):
-        for xi in range(obs_shape[1]):
-          new_x_gen_np = sess.run(new_x_gen, {x_sample: x_gen})
-          x_gen[:,yi,xi,:] = new_x_gen_np[:,yi,xi,:].copy()
-      return x_gen
-    else:
-      x = np.linspace(0.,2.,num=args.sample_batch_size)
-      #print (x.shape)
-      xx = np.tile(x, [2, 1])
-      xx = np.transpose(xx)
-      #print (xx.shape)
-      new_x_gen_np = sess.run(new_x_gen, {x_sample:xx})
-      #print (x.shape)
-      #print (new_x_gen_np.shape)
-      #print (new_x_gen_np)
-      #print (x)
-      M = np.concatenate([np.reshape(x, [-1, 1]), np.reshape(new_x_gen_np, [-1, 1])], axis=1)
-      #print (M)
-      return M
 
 # get loss gradients over multiple GPUs
 xs = []
+grads = []
+loss_gen = []
 loss_gen_test = []
-loss_gen_test_no_sum = []
+nlls_gen_test = []
 for i in range(args.nr_gpu):
     xs.append(tf.placeholder(tf.float32, shape=(args.batch_size, ) + obs_shape))
     with tf.device('/gpu:%d' % i):
+        # train
+        gen_par,jacs = model(xs[i], ema=None, **model_opt)
+        loss_gen.append(nn.loss(gen_par, jacs))
+        # gradients
+        grads.append(tf.gradients(loss_gen[i], all_params))
         # test
-        if args.model == 'pixel_cnn':
-          gen_par = model(xs[i], ema=None, **model_opt)
-          loss_gen_test.append(nn.loss(xs[i], gen_par,adjust_for_variance=True))
-          loss_gen_test_no_sum.append(nn.loss(xs[i], gen_par, sum_all=False))
-        else:
-          gen_par = model(xs[i], ema=None, **model_opt)
-          loss_gen_test.append(nn.loss(xs[i], gen_par))
+        model_opt_for_testing = model_opt
+        gen_par,jacs = model(xs[i], ema=None, **model_opt)
+        loss_gen_test.append(nn.loss(gen_par, jacs))
+        nlls_gen_test.append(-nn.compute_log_prob_x(gen_par, jacs))
+        
+
+# add gradients together and get training updates
+tf_lr = tf.placeholder(tf.float32, shape=[])
+with tf.device('/gpu:0'):
+    for i in range(1,args.nr_gpu):
+        loss_gen[0] += loss_gen[i]
+        loss_gen_test[0] += loss_gen_test[i]
+        for j in range(len(grads[0])):
+            grads[0][j] += grads[i][j]
+    # training op
+    optimizer = nn.adam_updates(all_params, grads[0], lr=tf_lr, mom1=0.95, mom2=0.9995)
 
 # convert loss to bits/dim
-bits_per_dim_test = loss_gen_test[0]/(np.log(2.)*np.prod(obs_shape)*args.batch_size)
-bits_per_dim_test_no_sum = loss_gen_test_no_sum[0]/(np.log(2.)*np.prod(obs_shape))
+bits_per_dim = loss_gen[0]/(args.nr_gpu*np.log(2.)*np.prod(obs_shape)*args.batch_size)
+bits_per_dim_test = loss_gen_test[0]/(args.nr_gpu*np.log(2.)*np.prod(obs_shape)*args.batch_size)
+bits_per_dim_test_per_image = nlls_gen_test[0]/(args.nr_gpu*np.log(2.)*np.prod(obs_shape))
 
 # init & save
 initializer = tf.initialize_all_variables()
 saver = tf.train.Saver()
 
+# sample from the model
+x_sample = tf.placeholder(tf.float32, shape=(args.sample_batch_size, ) + obs_shape)
+new_x_gen = inv_model(x_sample)
+#new_x_gen = nn.sample_from_gaussian(new_x_gen)  
+def sample_from_model(sess):
+  x_gen = np.random.normal(0.0, 1.0, (args.sample_batch_size,) + obs_shape)
+  #x_gen = np.tile(x_gen[0:4], (args.sample_batch_size//4, 1, 1, 1))
+  #x_gen = np.ones((args.sample_batch_size,) + obs_shape)
+  #for i in range(args.sample_batch_size//4):
+  #  x_gen[i*4:i*4+4,:16,:,:] *= 0.35*(i-3)
+  new_x_gen_np = sess.run(new_x_gen, {x_sample: x_gen})
+  l = 0.0
+  #feed_dict = { xs[i]: new_x_gen_np for i in range(args.nr_gpu) }
+  #l = sess.run(bits_per_dim_test_per_image, feed_dict)
+  return new_x_gen_np, l
+
+
 # input to pixelCNN is scaled from uint8 [0,255] to float in range [-1,1]
 def prepro(x):
-  if args.model == 'pixel_cnn':
-    return np.cast[np.float32]((x - 127.5) / 127.5)
-  else:
-    return x
+  #x[:,:,:,0] = 255.0
+  #x[:,:,:,1] = np.random.uniform(0.0,0.5)*255.0
+  #x[:,:,:,1] = 0.0
+  #x[:,:,:,2] = 0.0
+
+  #x = np.random.uniform(0.0,1.0,(x.shape[0], 32, 32, 3))*255.0
+
+  return np.cast[np.float32]((x - 127.5) / 127.5)
+
+def create_montage_image(images, height, width, n_row, n_col, n_channel):
+  images = images.reshape((n_row, n_col, height, width, n_channel))
+  images = images.transpose(0, 2, 1, 3, 4)
+  images = images.reshape((height * n_row, width * n_col, n_channel))
+  if n_channel == 1:
+    images = np.tile(images, (1,1,3))
+  return images
+
 
 def compute_likelihood(xf):
   print ("computing likelihood of image with mean %f" % np.mean(xf))
@@ -165,20 +184,6 @@ def compute_likelihood(xf):
   feed_dict = { xs[i]: xfs[i] for i in range(args.nr_gpu) }
   l = sess.run(bits_per_dim_test, feed_dict)
   return l
-
-def predict(xf, original):
-  print ("predicting image with mean %f" % np.mean(xf))
-  #xfs = np.split(xf, args.nr_gpu)
-  #new_x_gen = nn.sample_from_discretized_mix_logistic(gen_par, args.nr_logistic_mix)
-  #feed_dict = { xs[i]: xfs[i] for i in range(args.nr_gpu) }
-  #prediction = sess.run(new_x_gen, feed_dict)
-  x_gen = np.zeros(xf.shape)
-  for yi in range(x_gen.shape[1]):
-    for xi in range(x_gen.shape[2]):                      
-      new_x_gen_np = sess.run(new_x_gen_biased, {x_sample: x_gen, x_bias: original})
-      x_gen[:,yi,xi,:] = new_x_gen_np[:,yi,xi,:].copy()
-  prediction = x_gen
-  return prediction
 
 # |x| is assumed to be in range [-1,1]
 # distortions is a dictinary of distortions
@@ -225,7 +230,9 @@ def distort_images(x, distortions):
       distorted[:,i,:,2] += grad_color[2]
       distorted = np.clip(distorted,0.0,1.0)
   
-  distorted = ndimage.filters.gaussian_filter(distorted, distortions['blur'])
+  if distortions['blur'] > 0.0:
+    for i in range(num_images):
+      distorted[i] = ndimage.filters.gaussian_filter(distorted[i], distortions['blur'])
 
   if distortions['transform'] == True:
     distorted[:4,:,:,:] = predict(distorted[:4,:,:,:], x[:4,:,:,:])
@@ -234,195 +241,6 @@ def distort_images(x, distortions):
     #distorted = distorted*0.5 + 0.5
   
   return (distorted - 0.5)*2.0
-
-def inpaint_images(x):
-  
-  # take the first image and create region to inpaint
-  num_samples = 32
-  num_cols = 4
-  num_rows = (num_samples + num_cols-1)//num_cols
-  x = np.tile(x[0,:,:,:], (num_samples, 1, 1, 1))
-  original = x[0].copy()
-  blur_amount = 0.6
-  blurred = ndimage.filters.gaussian_filter(original, blur_amount)
-
-  plt.subplot2grid((num_rows+1, num_cols),(num_rows,0))
-  plt.axis('off')
-  plt.imshow(original*0.5+0.5)
-  plt.title('original')
-
-  # let's also blur the original image
-  x = ndimage.filters.gaussian_filter(x, blur_amount)  
-    
-  plt.subplot2grid((num_rows+1, num_cols),(num_rows,2))
-  plt.axis('off')
-  plt.imshow(blurred*0.5+0.5)
-  plt.title('blurred')
-
-  # predict
-  hole_size = 8
-  middle_h = x.shape[1]//2
-  middle_w = x.shape[2]//2
-  hole_start_y = middle_h - hole_size//2
-  hole_end_y = middle_h + hole_size//2
-  hole_start_x = middle_w - hole_size//2
-  hole_end_x = middle_w + hole_size//2
-  x[:,hole_start_y: hole_end_y + 1,
-    hole_start_x:hole_end_x + 1,:] = 1.0
-
-  plt.subplot2grid((num_rows+1, num_cols),(num_rows,1))
-  plt.axis('off')
-  plt.imshow(x[0]*0.5+0.5)
-  plt.title('inpainting area')
-
-
-  for yi in range(hole_start_y, hole_end_y+1):
-    for xi in range(hole_start_x, hole_end_x+1):
-      new_x_gen_np = sess.run(new_x_gen, {x_sample: x})
-      x[:,yi,xi,:] = new_x_gen_np[:,yi,xi,:].copy()
-      print ("inpainted (%d,%d)" % (yi,xi))
-  
-  # compute likelihoods
-  l = sess.run(bits_per_dim_test_no_sum, {xs[0]: x})
-  print ("likelihoods computed %s" % str(l))
-
-  # penalize deviation from blur
-  diff = np.abs((x-blurred)[:,hole_start_y:hole_end_y+1,hole_start_x:hole_end_x+1,:])
-  diffsum = np.sum(diff,(1,2,3)) / ((hole_end_y-hole_start_y) * (hole_end_x-hole_start_x))
-  #diffmax = np.amax(np.abs(diff),(1,2,3))
-  penalty = 10.0
-  l = l + penalty * diffsum
-
-  # sort 
-  order = np.argsort(l)
-
-  # save images
-  x = x*0.5 + 0.5
-  idx = 0
-  for ver in range(num_rows):
-    for hor in range(num_cols):
-      plt.subplot2grid((num_rows+1, num_cols),(ver,hor))
-      plt.axis('off')
-      plt.imshow(x[order[idx]])
-      plt.title('%f' % l[order[idx]])
-      idx = idx+1
-  
-  plt.savefig('test/inpaint_%s.png' % time.strftime("%m_%d_%H_%M_%S"), bbox_inches='tight')
-
-# |x| is a 3D WxHxC numpy tensor
-# |rect| is list of [top,left,bottom,right]
-def inpaint_superpixel(x, bias, rect, num_samples):
-  num_trials = 128
-  x = np.tile(x, (num_trials, 1, 1, 1))
-  print (rect)
-  hole_start_y = rect[0]
-  hole_end_y = rect[2]
-  hole_start_x = rect[1]
-  hole_end_x = rect[3]
-  x[:,hole_start_y: hole_end_y + 1,
-    hole_start_x:hole_end_x + 1,:] = 1.0
-  for yi in range(hole_start_y, hole_end_y+1):
-    for xi in range(hole_start_x, hole_end_x+1):
-      new_x_gen_np = sess.run(new_x_gen, {x_sample: x})
-      x[:,yi,xi,:] = new_x_gen_np[:,yi,xi,:].copy()
-      print ("inpainted (%d,%d)" % (yi,xi))
-  
-  # compute likelihoods
-  l = sess.run(bits_per_dim_test_no_sum, {xs[0]: x})
-  print ("likelihoods computed %s" % str(l))
-
-  # penalize deviation from blur
-  diff = np.abs((x-bias)[:,hole_start_y:hole_end_y+1,hole_start_x:hole_end_x+1,:])
-  diffsum = np.sum(diff,(1,2,3)) / ((hole_end_y-hole_start_y) * (hole_end_x-hole_start_x))
-  #diffmax = np.amax(np.abs(diff),(1,2,3))
-  penalty = 100.0
-  l = l + penalty * diffsum
-
-  # sort 
-  order = np.argsort(l)
-
-  # take top scores
-  order = order[:num_samples]
-  best_results = np.take(x, order, axis=0)
-  l = np.take(l, order, axis=0)
-
-  print ("superpixel at %s painted" % str(rect))
-
-  return best_results, l
-  
-
-  
-  
-
-def inpaint_images_by_superpixel(x):
-  # take the first image and create region to inpaint
-  num_samples = 32
-  num_cols = 4
-  num_rows = (num_samples + num_cols-1)//num_cols
-  img_h = x.shape[1]
-  img_w = x.shape[2]
-  x = np.tile(x[0,:,:,:], (num_samples, 1, 1, 1))
-  original = x[0].copy()
-  blur_amount = 0.6
-  blurred = ndimage.filters.gaussian_filter(original, blur_amount)
-
-  plt.subplot2grid((num_rows+1, num_cols),(num_rows,0))
-  plt.axis('off')
-  plt.imshow(original*0.5+0.5)
-  plt.title('original')
-
-  # let's also blur the original image
-  #x = ndimage.filters.gaussian_filter(x, blur_amount)  
-    
-  plt.subplot2grid((num_rows+1, num_cols),(num_rows,1))
-  plt.axis('off')
-  plt.imshow(x[0]*0.5+0.5)
-  plt.title('inpainting area')
-
-  plt.subplot2grid((num_rows+1, num_cols),(num_rows,2))
-  plt.axis('off')
-  plt.imshow(blurred*0.5+0.5)
-  plt.title('blurred')
-
-  # inpaint superpixel-by-superpixel
-  sp_w = 4 # width of superpixel
-  sp_h = 4 # height of superpixel
-  assert img_h%sp_h ==0 and img_w%sp_w == 0
-  painted_row_count = 0
-  for si in range(img_h//sp_h//3, img_h//sp_h):
-    for sj in range(img_w//sp_w):      
-      x = x[0]
-      rect = [si*sp_h, sj*sp_w, (si+1)*sp_h-1, (sj+1)*sp_w-1]
-      #x,l = inpaint_superpixel(x, blurred, rect, num_cols)
-      x,l = inpaint_superpixel(x, original, rect, num_cols)
-      
-    # save images if there's row permitted
-    if painted_row_count < num_rows:
-      for hor in range(num_cols):
-        plt.subplot2grid((num_rows+1, num_cols),(painted_row_count,hor))
-        plt.axis('off')
-        plt.imshow(x[hor]*0.5+0.5)
-        plt.title('%f' % l[hor])
-      painted_row_count += 1
-      plt.savefig('test/inpaint_%s.png' % time.strftime("%m_%d_%H_%M_%S"), bbox_inches='tight')
-       
-  plt.subplot2grid((num_rows+1, num_cols),(num_rows,3))
-  plt.axis('off')
-  plt.title('final')
-  plt.imshow(x[0]*0.5+0.5)
-
-  plt.savefig('test/inpaint_%s.png' % time.strftime("%m_%d_%H_%M_%S"), bbox_inches='tight')
-  
-
-
-
-def create_montage_image(images, height, width, n_row, n_col, n_channel):
-  images = images.reshape((n_row, n_col, height, width, n_channel))
-  images = images.transpose(0, 2, 1, 3, 4)
-  images = images.reshape((height * n_row, width * n_col, n_channel))
-  if n_channel == 1:
-    images = np.tile(images, (1,1,3))
-  return images
 
 
 def test_likelihoods(x):
@@ -443,12 +261,12 @@ def test_likelihoods(x):
   nll_matrix = np.zeros((num_images_per_row,num_images_per_row))
   for a in range(-radius,radius+1):
     for b in range(-radius,radius+1):
-      #istortions['tint_a'] = a*4
-      #istortions['tint_b'] = b*4
-      distortions['saturation_scale'] = 1.0 + a*0.3
-      distortions['contrast_scale'] = 1.0 + b*0.3
+      #distortions['tint_a'] = a*4
+      #distortions['tint_b'] = b*4
+      #distortions['saturation_scale'] = 1.0 + a*0.3
+      #distortions['contrast_scale'] = 1.0 + b*0.3
       #distortions['noise_scale'] = 0.03*a
-      #distortions['apply_gradient'] = True if b > 0 else False
+      distortions['apply_gradient'] = True if b > 0 else False
       #distortions['blur'] = 0.15 * (b + radius)
       #distortions['transform'] = True if b > 0 else False            
       images = distort_images(x, distortions)        
@@ -478,57 +296,15 @@ def test_likelihoods(x):
   plt.title("nll by the horizontal axis")
 
 
-  plt.savefig('test/test_contrast_and_saturation_%s.png' % time.strftime("%m_%d_%H_%M_%S"), bbox_inches='tight')
+  plt.savefig('test_results/test_contrast_and_saturation_%s.png' % time.strftime("%m_%d_%H_%M_%S"), bbox_inches='tight')
 
-def get_timestamp():
-  now = datetime.datetime.now(dateutil.tz.tzlocal())
-  return now.strftime('%Y_%m_%d_%H_%M_%S')
-
-
-def save_images(images, height, width, n_row, n_col, n_channel,
-      cmin=0.0, cmax=1.0, directory="./", prefix="sample"):
-  
-  images = create_montage_image(images, height, width, n_row, n_col, n_channel)
-
-  filename = '%s_%s.png' % (prefix, get_timestamp())  
-  scipy.misc.toimage(images) \
-      .save(os.path.join(directory, filename))
-
-  return images.reshape((1,height * n_row, width * n_col, 3))
-
-
-def transform_images(x):
-  num_iterations = 2
-  num_images = x.shape[0]
-  num_images_to_show = 4
-  height = x.shape[1]
-  width = x.shape[2]
-  results = np.ones((num_images_to_show*num_iterations, height, width, 3))
-  original = x[:num_images_to_show,:,:,:]
-  original = ndimage.filters.gaussian_filter(original, 0.6)
-  transformed = original
-  for i in range(num_iterations):
-    np.copyto(results[i*num_images_to_show:(i+1)*num_images_to_show,:,:,:], 
-              transformed)
-    #predicted_dist = compute_prediction((transformed-0.5)*2.0)
-    #log_prediction = np.log(predicted_dist)
-    #conditioned_prediction = log_prediction #-l2*0.002 
-    #print (conditioned_prediction.shape)
-    #next_candidate = np.argmax(conditioned_prediction, 4, None)
-    if i >= num_iterations-1:
-      break
-    next_candidate = predict(transformed, original)
-    transformed = next_candidate
-  save_images(results*0.5+0.5, height, width, num_iterations, num_images_to_show, 3, 
-                directory="test", prefix="transformed")
-  print ("transformed iamges saved")
-      
 
 # //////////// perform training //////////////
 if not os.path.exists(args.save_dir):
     os.makedirs(args.save_dir)
 print('starting training')
 test_bpd = []
+lr = args.learning_rate
 with tf.Session() as sess:
     for epoch in range(args.max_epochs):
         begin = time.time()
@@ -539,47 +315,65 @@ with tf.Session() as sess:
             train_data.reset() # rewind the iterator back to 0 to do one full epoch
             print('initializing the model...')
             sess.run(initializer,{x_init: prepro(x)})
-            ckpt_file = args.save_dir + '/params_' + args.data_set + '.ckpt'
-            print('restoring parameters from', ckpt_file)
-            saver.restore(sess, ckpt_file)
+            if args.load_params:
+                ckpt_file = args.save_dir + '/params_' + args.data_set + '.ckpt'
+                print('restoring parameters from', ckpt_file)
+                saver.restore(sess, ckpt_file)
+            util.show_all_variables()
 
-        # compute likelihood
+        
+
+        # train for one epoch
+        train_losses = []
+        skip_train = True
+        if not skip_train:
+          print ("Training (%d/%d) started" % (epoch, args.max_epochs))
+          for t,x in enumerate(train_data):          
+            # prepro the data and split it for each gpu
+            xf = prepro(x)
+            xfs = np.split(xf, args.nr_gpu)
+            #print (xfs)
+            # forward/backward/update model on each gpu
+            lr *= args.lr_decay
+            feed_dict = { tf_lr: lr }
+            feed_dict.update({ xs[i]: xfs[i] for i in range(args.nr_gpu) })
+            l,_ = sess.run([bits_per_dim, optimizer], feed_dict)
+            train_losses.append(l)
+        train_loss_gen = np.mean(train_losses)
+
+        # compute likelihood over test split
         test_losses = []
         skip_test = False
         if not skip_test:
           print ("Testing...")
-          idx = 0
           for x in test_data:
-            if idx >= 1:
-              break
-            ++idx
             xf = prepro(x)
-            #transform_images(xf)
-            test_likelihoods(xf)
-            #inpaint_images_by_superpixel(xf)
-            #inpaint_images(xf)
-          #test_losses.append(l)
-          test_loss_gen = np.mean(test_losses)
-          test_bpd.append(test_loss_gen)
-          print ("test_loss_gen=%f" % test_loss_gen)
+            #test_likelihoods(xf)
+            #xfs = np.split(xf, args.nr_gpu)
+            #feed_dict = { xs[i]: xfs[i] for i in range(args.nr_gpu) }
+            #l = sess.run(bits_per_dim_test, feed_dict)
+            #test_losses.append(l)
+        test_loss_gen = np.mean(test_losses)
+        test_bpd.append(test_loss_gen)
 
-        
+        # log progress to console
+        print("Iteration %d, time = %ds, train bits_per_dim = %.4f, test bits_per_dim = %.4f" % (epoch, time.time()-begin, train_loss_gen, test_loss_gen))
+        sys.stdout.flush()
 
-        print ("Generating samples...")
+        if epoch % args.save_interval == 0:
 
-        # generate samples from the model
-        if args.model == 'pixel_cnn':
-          sample_x = sample_from_model(sess)
-          img_tile = plotting.img_tile(sample_x, aspect_ratio=1.0, border_color=1.0, stretch=True)
-          img = plotting.plot_img(img_tile, title=args.data_set + ' samples')
-          plotting.plt.savefig(os.path.join(args.save_dir,'%s_sample%d.png' % (args.data_set, epoch)))
-          plotting.plt.close('all')
-        else:
-          sample_x = sample_from_model(sess)
-          plt.clf()
-          plt.scatter(sample_x[:,0], sample_x[:,1])
-          plt.savefig("real_nvp_samples.png")
+            print ("Generating samples...")
 
-          # save params
-          saver.save(sess, args.save_dir + '/params_' + args.data_set + '.ckpt')
-          np.savez(args.save_dir + '/test_bpd_' + args.data_set + '.npz', test_bpd=np.array(test_bpd))
+            # generate samples from the model
+            sampled_x,nll = sample_from_model(sess)
+            #util.save_images_with_nll(sampled_x, nll)
+            montage = create_montage_image(sampled_x,32,32,6,6,3)
+            scipy.misc.imsave("samples/samples_%03d.png" % epoch, montage)
+            #img_tile = plotting.img_tile(sampled_x, aspect_ratio=1.0, border_color=1.0, stretch=True)
+            #img = plotting.plot_img(img_tile, title=args.data_set + ' samples')
+            #plotting.plt.savefig(os.path.join(args.save_dir,'%s_sample%d.png' % (args.data_set, epoch)))
+            #plotting.plt.close('all')
+            
+            # save params
+            #saver.save(sess, args.save_dir + '/params_' + args.data_set + '.ckpt')
+            #np.savez(args.save_dir + '/test_bpd_' + args.data_set + '.npz', test_bpd=np.array(test_bpd))

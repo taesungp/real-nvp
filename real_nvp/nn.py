@@ -30,8 +30,18 @@ class CouplingLayer(Layer):
   def batch_norm(self, x):
     mu = tf.reduce_mean(x)
     sig2 = tf.reduce_mean(tf.square(x-mu))    
-    x = (x-mu)/tf.sqrt(sig2 + 1.0)
-    return x
+    x = (x-mu)/tf.sqrt(sig2 + 1.0e-6)
+    return x, sig2
+
+  def get_normalized_weights(self, name, weights_shape):
+    weights = tf.get_variable(name, weights_shape, tf.float32,
+                              tf.contrib.layers.xavier_initializer())
+    scale = tf.get_variable(name + "_scale", [1], tf.float32, 
+                              tf.contrib.layers.xavier_initializer(),
+                              regularizer=tf.contrib.layers.l2_regularizer(5e-5))
+    norm = tf.sqrt(tf.reduce_sum(tf.square(weights)))
+    return weights/norm * scale
+    
 
   
   # corresponds to the function m and l in the RealNVP paper
@@ -46,48 +56,41 @@ class CouplingLayer(Layer):
       input_channel = xs[3]
       y = x
 
-      y = self.batch_norm(y)
+      y,_ = self.batch_norm(y)
       weights_shape = [1, 1, input_channel, channel]
-      weights = tf.get_variable("weights_input", weights_shape, tf.float32, 
-                                tf.contrib.layers.xavier_initializer())
+      weights = self.get_normalized_weights("weights_input", weights_shape)
+      
       y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)
-      y = self.batch_norm(y)
+      y,_ = self.batch_norm(y)
       y = tf.nn.relu(y)
 
       skip = y
       num_residual_blocks = 8
       for r in range(num_residual_blocks):        
         weights_shape = [kernel_h, kernel_w, channel, channel]
-        weights = tf.get_variable("weights%d_1" % r, weights_shape, tf.float32, 
-                                  tf.contrib.layers.xavier_initializer())
+        weights = self.get_normalized_weights("weights%d_1" % r, weights_shape)
         y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)
-        y = self.batch_norm(y)
+        y,_ = self.batch_norm(y)
         y = tf.nn.relu(y)
         weights_shape = [kernel_h, kernel_w, channel, channel]
-        weights = tf.get_variable("weights%d_2" % r, weights_shape, tf.float32, 
-                                  tf.contrib.layers.xavier_initializer())
+        weights = self.get_normalized_weights("weights%d_2" % r, weights_shape)
         y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)
-        y = self.batch_norm(y)
+        y,_ = self.batch_norm(y)
         y += skip
         y = tf.nn.relu(y)
         skip = y
 
         
-      weights = tf.get_variable("weights_output", [1, 1, channel, input_channel*2],
-                                tf.float32, tf.contrib.layers.xavier_initializer())
+      weights = self.get_normalized_weights("weights_output", [1, 1, channel, input_channel*2])
       y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)    
 
-      #if self.use_batchnorm:
-      #  y = self.batch_norm(y)
-      #else:
-      y = y*0.1
+      y = tf.tanh(y)
+      scale_factor = self.get_normalized_weights("weights_tanh_scale", [1])
+      y *= scale_factor
+
 
       l = y[:,:,:,:input_channel] * (-mask+1)
       m = y[:,:,:,input_channel:] * (-mask+1)
-
-      #if not self.use_batchnorm:
-      #  l = tf.minimum(l, 10)
-
       
       return l,m
 
@@ -130,8 +133,14 @@ class CouplingLayer(Layer):
       l,m = self.function_l_m(x1, b)
       y = x1 + tf.mul(-b+1.0, x*tf.check_numerics(tf.exp(l), "exp has NaN") + m)
       log_det_jacobian = tf.check_numerics(tf.reduce_sum(l, [1,2,3]), "l has NaN")
-      #log_det_jacobian += xs[1]*xs[2]*xs[3]*0.5*tf.log(tf.sqrt(self.sig2_l + 1e-5)*10)
       sum_log_det_jacobians += log_det_jacobian
+
+      #y,sig2 = self.batch_norm(y)
+      #sum_log_det_jacobians += -xs[1]*xs[2]*xs[3]*0.5*tf.log(sig2 + 1e-6)
+      
+
+      #log_det_jacobian += xs[1]*xs[2]*xs[3]*0.5*tf.log(tf.sqrt(self.sig2_l + 1e-5)*10)
+      
 
       return y,sum_log_det_jacobians, z
 
