@@ -249,8 +249,21 @@ def compute_log_prob_x(z, sum_log_det_jacobians):
   return tf.check_numerics(log_prob_x, "log_prob_x has NaN")
 
 
-def loss(z, sum_log_det_jacobians):
-  return -tf.reduce_sum(compute_log_prob_x(z, sum_log_det_jacobians))
+def loss(z, sum_log_det_jacobians, logits_fake=None):
+  loss_gaussianization = -tf.reduce_sum(compute_log_prob_x(z, sum_log_det_jacobians))
+
+  if logits_fake is not None:
+    loss_adversarial = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits_fake, tf.ones_like(logits_fake)))
+
+    zs = int_shape(z)
+    K = zs[0]*zs[1]*zs[2]*zs[3]*np.log(2.)
+
+    combined_loss = loss_gaussianization + K*loss_adversarial
+  else:
+    combined_loss = loss_gaussianization  
+    
+  return combined_loss
+
 
 
   

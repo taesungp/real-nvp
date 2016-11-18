@@ -6,7 +6,7 @@ from real_nvp.discriminator.nn import *
 
 def model_spec(x, init=True, ema=None):
 
-  df_dim = 64
+  df_dim = 32
   batch_size = int_shape(x)[0]
   
   # batch normalization : deals with poor initialization helps gradient flow

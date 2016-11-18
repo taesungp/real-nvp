@@ -31,6 +31,8 @@ import pixel_cnn_pp.scopes as scopes
 from pixel_cnn_pp.model import model_spec as pixel_cnn_model_spec
 from real_nvp.model import model_spec as real_nvp_model_spec
 from real_nvp.model import inv_model_spec as real_nvp_inv_model_spec
+import real_nvp.discriminator.nn as dn
+from real_nvp.discriminator.model import model_spec as discriminator_model_spec
 import data.cifar10_data as cifar10_data
 import data.imagenet_data as imagenet_data
 import data.csv_data as csv_data
@@ -53,7 +55,6 @@ parser.add_argument('-m', '--nr_logistic_mix', type=int, default=10, help='Numbe
 parser.add_argument('-l', '--learning_rate', type=float, default=0.001, help='Base learning rate')
 parser.add_argument('-e', '--lr_decay', type=float, default=0.999995, help='Learning rate decay, applied every step of the optimization')
 parser.add_argument('-b', '--batch_size', type=int, default=12, help='Batch size during training per GPU')
-parser.add_argument('-a', '--init_batch_size', type=int, default=100, help='How much data to use for data-dependent initialization.')
 parser.add_argument('-p', '--dropout_p', type=float, default=0.5, help='Dropout strength (i.e. 1 - keep_prob). 0 = No dropout, higher = more dropout.')
 parser.add_argument('-x', '--max_epochs', type=int, default=5000, help='How many epochs to run in total?')
 parser.add_argument('-g', '--nr_gpu', type=int, default=8, help='How many GPUs to distribute the training across?')
@@ -86,12 +87,15 @@ nn = {'pixel_cnn': pixel_cnn_nn,
 # create the model
 model_opt = {'pixel_cnn':{ 'nr_resnet': args.nr_resnet, 'nr_filters': args.nr_filters, 'nr_logistic_mix': args.nr_logistic_mix, 'dropout_p': args.dropout_p },
              'real_nvp':{}}[args.model]
-model = tf.make_template('model', model_spec)
-inv_model = tf.make_template('model', real_nvp_inv_model_spec, unique_name_='model')
+model = tf.make_template('generator_model', model_spec)
+inv_model = tf.make_template('generator_model', real_nvp_inv_model_spec, 
+                             unique_name_='generator_model')
+discriminator_model = tf.make_template('discriminator_model', discriminator_model_spec)
 
-x_init = tf.placeholder(tf.float32, shape=(args.init_batch_size,) + obs_shape)
+x_init = tf.placeholder(tf.float32, shape=(args.batch_size,) + obs_shape)
 # run once for data dependent initialization of parameters
 gen_par = model(x_init, init=True, **model_opt)
+discriminator_par = discriminator_model(x_init, init=True, **model_opt)
 
 # keep track of moving average
 all_params = tf.trainable_variables()
@@ -107,23 +111,63 @@ def sample_from_model(sess):
   new_x_gen_np = sess.run(new_x_gen, {x_sample: x_gen})
   return new_x_gen_np
 
+discriminator_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 
+                                            scope='discriminator_model')
+generator_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 
+                                            scope='generator_model')
+print ("Printing variables for upadte")
+total_count = 0
+for idx, op in enumerate(generator_params):
+  shape = op.get_shape()
+  count = np.prod(shape)
+  print ("FOR UPDATE: [%2d] %s %s = %s" % (idx, op.name, shape, count))
+  total_count += int(count)
+for idx, op in enumerate(discriminator_params):
+  shape = op.get_shape()
+  count = np.prod(shape)
+  print ("FOR UPDATE: [%2d] %s %s = %s" % (idx, op.name, shape, count))
+  total_count += int(count)
+print ("Total %d variables to be optimized" % total_count)
+
 # get loss gradients over multiple GPUs
 xs = []
-grads = []
+grads_gen = []
+grads_dis = []
 loss_gen = []
 loss_gen_test = []
+nll_train = []
+nll_test = []
+loss_dis = [] # discriminator loss
+loss_dis_test = []
 for i in range(args.nr_gpu):
     xs.append(tf.placeholder(tf.float32, shape=(args.batch_size, ) + obs_shape))
     with tf.device('/gpu:%d' % i):
-        # train
-        gen_par,jacs = model(xs[i], ema=None, **model_opt)
-        loss_gen.append(nn.loss(gen_par, jacs))
-        # gradients
-        grads.append(tf.gradients(loss_gen[i], all_params))
-        # test
-        model_opt_for_testing = model_opt
-        gen_par,jacs = model(xs[i], ema=None, **model_opt)
-        loss_gen_test.append(nn.loss(gen_par, jacs))
+      # train
+      
+      # output of generator
+      z,jacs = model(xs[i], ema=None, **model_opt)
+      nll_train.append(nn.loss(z,jacs))
+
+      # output of discriminator
+      sampled_x = inv_model(z)
+      d_logits_of_fake = discriminator_model(sampled_x, ema=None, **model_opt)
+      d_logits_of_real = discriminator_model(xs[i], ema=None, **model_opt)
+      
+      # loss of generator
+      loss_gen.append(nn.loss(z, jacs, d_logits_of_fake))
+
+      # loss of discriminator
+      loss_dis.append(dn.loss(d_logits_of_real, d_logits_of_fake))
+      
+      # gradients
+      grads_gen.append(tf.gradients(loss_gen[i], generator_params))
+      grads_dis.append(tf.gradients(loss_dis[i], discriminator_params))
+      
+      # test
+      z,jacs = model(xs[i], ema=None, **model_opt)
+      loss_gen_test.append(nn.loss(z, jacs, d_logits_of_fake))
+      nll_test.append(nn.loss(z, jacs))
+      loss_dis_test.append(dn.loss(d_logits_of_real, d_logits_of_fake))
 
 # add gradients together and get training updates
 tf_lr = tf.placeholder(tf.float32, shape=[])
@@ -131,14 +175,27 @@ with tf.device('/gpu:0'):
     for i in range(1,args.nr_gpu):
         loss_gen[0] += loss_gen[i]
         loss_gen_test[0] += loss_gen_test[i]
-        for j in range(len(grads[0])):
-            grads[0][j] += grads[i][j]
-    # training op
-    optimizer = nn.adam_updates(all_params, grads[0], lr=tf_lr, mom1=0.95, mom2=0.9995)
+        loss_dis[0] += loss_dis[i]
+        loss_dis_test[0] += loss_dis_test[i]
+        nll_train[0] += nll_train[i]
+        nll_test[0] += nll_test[i]
 
-# convert loss to bits/dim
+        for j in range(len(grads_gen[0])):
+            grads_gen[0][j] += grads_gen[i][j]
+        for j in range(len(grads_dis[0])):
+            grads_dis[0][j] += grads_dis[i][j]
+    # training op
+    optimizer_gen = nn.adam_updates(generator_params, grads_gen[0], lr=tf_lr, mom1=0.95, mom2=0.9995)
+    optimizer_dis = nn.adam_updates(discriminator_params, grads_dis[0], lr=tf_lr, mom1=0.95, mom2=0.9995)
+
+# convert generator loss to bits/dim
 bits_per_dim = loss_gen[0]/(args.nr_gpu*np.log(2.)*np.prod(obs_shape)*args.batch_size)
 bits_per_dim_test = loss_gen_test[0]/(args.nr_gpu*np.log(2.)*np.prod(obs_shape)*args.batch_size)
+nll_bits_per_dim_test = nll_test[0]/(args.nr_gpu*np.log(2.)*np.prod(obs_shape)*args.batch_size)
+
+# convert discriminator loss
+discriminator_loss = loss_dis[0]/args.nr_gpu
+discriminator_loss_test = loss_dis_test[0]/args.nr_gpu
 
 # init & save
 initializer = tf.initialize_all_variables()
@@ -172,117 +229,6 @@ def compute_likelihood(xf):
   l = sess.run(bits_per_dim_test, feed_dict)
   return l
 
-# |x| is assumed to be in range [-1,1]
-# distortions is a dictinary of distortions
-def distort_images(x, distortions):
-  x = x*0.5 + 0.5
-  x = np.clip(x, 0.0, 1.0)
-  num_images = x.shape[0]
-  width = x.shape[1]
-  height = x.shape[2]
-  
-  distorted = np.copy(x)
-  
-  distorted = color.rgb2lab(distorted)
-  for i in range(num_images):
-    distorted[i,:,:,1] += distortions['tint_a']
-    distorted[i,:,:,2] += distortions['tint_b']
-    distorted[i] = color.lab2rgb(distorted[i])
-
-  distorted = color.rgb2lab(distorted)
-  distorted[:,:,:,1:3] *= distortions['saturation_scale']
-
-
-  for i in range(distorted.shape[0]):
-    distorted[i] = color.lab2rgb(distorted[i])
-
-      
-  distorted = 0.5 + (distorted - 0.5) * distortions['contrast_scale']
-  distorted = np.clip(distorted, 0.0, 1.0)
-      
-  
-  distorted += (np.random.randn(num_images,width,height,3)-0.5)*distortions['noise_scale']
-  distorted = np.clip(distorted, 0.0, 1.0)
-
-  
-
-  if distortions['apply_gradient'] == True:
-    top_color = np.array([0.0, 0.0, 0.0])
-    bottom_color = np.array([0.8, 0.2, 0.2])
-    height = distorted.shape[1]
-    for i in range(height):
-      grad_color = top_color * float(height - i) / height + bottom_color * float(i)/height
-      distorted[:,i,:,0] += grad_color[0]
-      distorted[:,i,:,1] += grad_color[1]
-      distorted[:,i,:,2] += grad_color[2]
-      distorted = np.clip(distorted,0.0,1.0)
-  
-  distorted = ndimage.filters.gaussian_filter(distorted, distortions['blur'])
-
-  if distortions['transform'] == True:
-    distorted[:4,:,:,:] = predict(distorted[:4,:,:,:], x[:4,:,:,:])
-    #sample_x = sample_from_model(sess)
-    #sample_x = np.tile(sample_x, (2, 1, 1, 1))
-    #distorted = distorted*0.5 + 0.5
-  
-  return (distorted - 0.5)*2.0
-
-
-def test_likelihoods(x):
-  #x = x[:4,:,:,:]
-  distortions = {}
-  distortions['tint_a'] = 0
-  distortions['tint_b'] = 0
-  distortions['saturation_scale'] = 1.0
-  distortions['contrast_scale'] = 1.0
-  distortions['noise_scale'] = 0.0
-  distortions['apply_gradient'] = False
-  distortions['blur'] = 0.0
-  distortions['transform'] = False
-  radius = 2
-  w = x.shape[1]
-  h = x.shape[2]
-  num_images_per_row = radius*2+1
-  nll_matrix = np.zeros((num_images_per_row,num_images_per_row))
-  for a in range(-radius,radius+1):
-    for b in range(-radius,radius+1):
-      #distortions['tint_a'] = a*4
-      #distortions['tint_b'] = b*4
-      distortions['saturation_scale'] = 1.0 + a*0.3
-      distortions['contrast_scale'] = 1.0 + b*0.3
-      #distortions['noise_scale'] = 0.03*a
-      #distortions['apply_gradient'] = True if b > 0 else False
-      #distortions['blur'] = 0.15 * (b + radius)
-      #distortions['transform'] = True if b > 0 else False            
-      images = distort_images(x, distortions)        
-      print ("distort_images changed images of batch size %d to %d" % (x.shape[0], images.shape[0]))
-      nll = compute_likelihood(images)
-      nll_matrix[a+radius,b+radius] = nll
-      print ("computing likelihood of (a,b)=(%d,%d) = %f..." % (a,b,nll))
-      images = (images*0.5 + 0.5)
-      images = images[:4,:,:,:]
-      montage = create_montage_image(images,w,h,2,2,3)
-      plt.subplot2grid((num_images_per_row+2,num_images_per_row),(a+radius,b+radius))
-      plt.axis('off')
-      plt.imshow(montage)
-      plt.title('%f' % nll)
-  
-  chart = plt.subplot2grid((num_images_per_row+2,num_images_per_row),(num_images_per_row,0), 
-                           colspan=num_images_per_row)
-  chart.plot(range(-radius, radius+1), nll_matrix)
-  plt.ylabel("nll")
-  plt.title("nll by the vertical axis")
-    
-
-  chart = plt.subplot2grid((num_images_per_row+2,num_images_per_row),(num_images_per_row+1,0), 
-                           colspan=num_images_per_row)
-  chart.plot(range(-radius, radius+1), np.transpose(nll_matrix))
-  plt.ylabel("nll")
-  plt.title("nll by the horizontal axis")
-
-
-  plt.savefig('test/test_contrast_and_saturation_%s.png' % time.strftime("%m_%d_%H_%M_%S"), bbox_inches='tight')
-
 
 # //////////// perform training //////////////
 if not os.path.exists(args.save_dir):
@@ -296,7 +242,7 @@ with tf.Session() as sess:
 
         # init
         if epoch == 0:
-            x = train_data.next(args.init_batch_size) # manually retrieve exactly init_batch_size examples
+            x = train_data.next(args.batch_size) # manually retrieve exactly batch_size examples
             train_data.reset() # rewind the iterator back to 0 to do one full epoch
             print('initializing the model...')
             sess.run(initializer,{x_init: prepro(x)})
@@ -304,45 +250,62 @@ with tf.Session() as sess:
                 ckpt_file = args.save_dir + '/params_' + args.data_set + '.ckpt'
                 print('restoring parameters from', ckpt_file)
                 saver.restore(sess, ckpt_file)
-            util.show_all_variables()
+            #util.show_all_variables()
 
         
 
         # train for one epoch
-        train_losses = []
-        skip_train = False
-        if not skip_train:
-          print ("Training (%d/%d) started" % (epoch, args.max_epochs))
-          for t,x in enumerate(train_data):          
-            # prepro the data and split it for each gpu
-            xf = prepro(x)
-            xfs = np.split(xf, args.nr_gpu)
-            #print (xfs)
-            # forward/backward/update model on each gpu
-            lr *= args.lr_decay
-            feed_dict = { tf_lr: lr }
-            feed_dict.update({ xs[i]: xfs[i] for i in range(args.nr_gpu) })
-            l,_ = sess.run([bits_per_dim, optimizer], feed_dict)
-            train_losses.append(l)
-        train_loss_gen = np.mean(train_losses)
+        train_losses_gen = []
+        train_losses_dis = []
+        last_l_dis = 0.0
+        print ("Training (%d/%d) started" % (epoch, args.max_epochs))
+        for t,x in enumerate(train_data):          
+          # prepro the data and split it for each gpu
+          xf = prepro(x)
+          xfs = np.split(xf, args.nr_gpu)
+          #print (xfs)
+          # forward/backward/update model on each gpu
+          lr *= args.lr_decay
+          feed_dict = { tf_lr: lr }
+          feed_dict.update({ xs[i]: xfs[i] for i in range(args.nr_gpu) })
+          if last_l_dis < 0.2:
+            # only train generator
+            l_gen, l_dis,_ = sess.run([bits_per_dim, discriminator_loss, 
+                                       optimizer_gen], feed_dict)
+          else:
+            l_gen, l_dis,_,_ = sess.run([bits_per_dim, discriminator_loss, 
+                                         optimizer_gen, optimizer_dis], feed_dict)
+          last_l_dis = l_dis
+          sys.stdout.write('%.4f/%.4f ' % (l_gen, l_dis))
+          sys.stdout.flush()
+
+          train_losses_gen.append(l_gen)
+          train_losses_dis.append(l_dis)
+
+        train_loss_gen = np.mean(train_losses_gen)
+        train_loss_dis = np.mean(train_losses_dis)
 
         # compute likelihood over test split
-        test_losses = []
-        skip_test = False
-        if not skip_test:
-          print ("Testing...")
-          for x in test_data:
-            xf = prepro(x)
-            #test_likelihoods(xf)
-            xfs = np.split(xf, args.nr_gpu)
-            feed_dict = { xs[i]: xfs[i] for i in range(args.nr_gpu) }
-            l = sess.run(bits_per_dim_test, feed_dict)
-            test_losses.append(l)
-        test_loss_gen = np.mean(test_losses)
+        test_losses_gen = []
+        test_nlls_gen = []
+        test_losses_dis = []
+        print ("Testing...")
+        for x in test_data:
+          xf = prepro(x)
+          xfs = np.split(xf, args.nr_gpu)
+          feed_dict = { xs[i]: xfs[i] for i in range(args.nr_gpu) }
+          l_gen, nll_gen, l_dis  = sess.run([bits_per_dim_test, nll_bits_per_dim_test, 
+                                    discriminator_loss_test], feed_dict)
+          test_losses_gen.append(l_gen)
+          test_nlls_gen.append(nll_gen)
+          test_losses_dis.append(l_dis)
+        test_loss_gen = np.mean(test_losses_gen)
+        test_nll_gen = np.mean(test_nlls_gen)
+        test_loss_dis = np.mean(test_losses_dis)
         test_bpd.append(test_loss_gen)
 
         # log progress to console
-        print("Iteration %d, time = %ds, train bits_per_dim = %.4f, test bits_per_dim = %.4f" % (epoch, time.time()-begin, train_loss_gen, test_loss_gen))
+        print("Iteration %d, time = %ds, train bits_per_dim = %.4f, test bits_per_dim = %.4f discriminator train = %.4f, discriminator test = %4.f, nll test = %.4f" % (epoch, time.time()-begin, train_loss_gen, test_loss_gen, train_loss_dis, test_loss_dis, test_nll_gen))
         sys.stdout.flush()
 
         if epoch % args.save_interval == 0:
