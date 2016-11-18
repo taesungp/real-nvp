@@ -76,6 +76,17 @@ def linear(input_, output_size, scope=None, stddev=0.02, bias_start=0.0, with_w=
         else:
             return tf.matmul(input_, matrix) + bias
 
+def minibatch(input_, num_kernels=24, kernel_dim=16):
+  shape = input_.get_shape().as_list()
+  input_ = tf.reshape(input_, [shape[0], -1])
+  x = linear(input_, num_kernels*kernel_dim, scope="minibatch_linear")
+  activation = tf.reshape(x, (-1, num_kernels, kernel_dim))
+  diffs = tf.expand_dims(activation, 3) - \
+          tf.expand_dims(tf.transpose(activation, [1,2,0]), 0)
+  abs_diffs = tf.reduce_sum(tf.abs(diffs), 2)
+  minibatch_features = tf.reduce_sum(tf.exp(-abs_diffs), 2)
+  return tf.concat(1, [input_, minibatch_features])
+
 
 def loss(logits_real, logits_fake):
   loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits_real, tf.ones_like(logits_real)))

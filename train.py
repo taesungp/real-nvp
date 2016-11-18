@@ -44,7 +44,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('-i', '--data_dir', type=str, default='/tmp/pxpp/data', help='Location for the dataset')
 parser.add_argument('-o', '--save_dir', type=str, default='/tmp/pxpp/save', help='Location for parameter checkpoints and samples')
 parser.add_argument('-d', '--data_set', type=str, default='cifar', help='Can be either cifar|imagenet')
-parser.add_argument('-t', '--save_interval', type=int, default=20, help='Every how many epochs to write checkpoint/samples?')
+parser.add_argument('-t', '--save_interval', type=int, default=4, help='Every how many epochs to write checkpoint/samples?')
 parser.add_argument('-r', '--load_params', type=int, default=0, help='Restore training from previous model checkpoint? 1 = Yes, 0 = No')
 # model
 parser.add_argument('--model', type=str, default='real_nvp', help='model name: pixel_cnn, real_nvp')
@@ -94,8 +94,8 @@ discriminator_model = tf.make_template('discriminator_model', discriminator_mode
 
 x_init = tf.placeholder(tf.float32, shape=(args.batch_size,) + obs_shape)
 # run once for data dependent initialization of parameters
-gen_par = model(x_init, init=True, **model_opt)
-discriminator_par = discriminator_model(x_init, init=True, **model_opt)
+gen_par,_ = model(x_init, init=True, **model_opt)
+discriminator_par = discriminator_model(gen_par, init=True, **model_opt)
 
 # keep track of moving average
 all_params = tf.trainable_variables()
@@ -149,9 +149,17 @@ for i in range(args.nr_gpu):
       nll_train.append(nn.loss(z,jacs))
 
       # output of discriminator
-      sampled_x = inv_model(z)
-      d_logits_of_fake = discriminator_model(sampled_x, ema=None, **model_opt)
-      d_logits_of_real = discriminator_model(xs[i], ema=None, **model_opt)
+      #mask = tf.round(tf.random_uniform(nn.int_shape(z)))
+      
+      #random_z = tf.random_normal(nn.int_shape(z)) * mask +\
+      #           z * (1.0-mask)
+      random_z = tf.random_normal(nn.int_shape(z))
+      
+      #sampled_x = inv_model(random_z)
+      #d_logits_of_fake = discriminator_model(sampled_x, ema=None, **model_opt)
+      #d_logits_of_real = discriminator_model(xs[i], ema=None, **model_opt)
+      d_logits_of_fake = discriminator_model(random_z, ema=None, **model_opt)
+      d_logits_of_real = discriminator_model(z, ema=None, **model_opt)
       
       # loss of generator
       loss_gen.append(nn.loss(z, jacs, d_logits_of_fake))
@@ -210,7 +218,11 @@ def prepro(x):
 
   #x = np.random.uniform(0.0,1.0,(x.shape[0], 32, 32, 3))*255.0
 
-  return np.cast[np.float32]((x - 127.5) / 127.5)
+  # corrupt data (Tapani Raiko's dequantization)
+  corruption_level = 1.0
+  x = x + corruption_level * np.random.uniform(0.0,1.0,(x.shape[0],x.shape[1],x.shape[2],x.shape[3]))
+
+  return np.cast[np.float32]((x - 128.0) / 128.0)
 
 def create_montage_image(images, height, width, n_row, n_col, n_channel):
   images = images.reshape((n_row, n_col, height, width, n_channel))
@@ -268,15 +280,17 @@ with tf.Session() as sess:
           lr *= args.lr_decay
           feed_dict = { tf_lr: lr }
           feed_dict.update({ xs[i]: xfs[i] for i in range(args.nr_gpu) })
-          if last_l_dis < 0.2:
+          if last_l_dis < 0.02:
             # only train generator
-            l_gen, l_dis,_ = sess.run([bits_per_dim, discriminator_loss, 
+            l_gen, l_dis, _ = sess.run([bits_per_dim, discriminator_loss, 
                                        optimizer_gen], feed_dict)
           else:
             l_gen, l_dis,_,_ = sess.run([bits_per_dim, discriminator_loss, 
                                          optimizer_gen, optimizer_dis], feed_dict)
+          #sys.stdout.write('discriminator trained ')          
           last_l_dis = l_dis
-          sys.stdout.write('%.4f/%.4f ' % (l_gen, l_dis))
+          if t%10==0:
+            sys.stdout.write('%.4f/%.4f ' % (l_gen, l_dis))
           sys.stdout.flush()
 
           train_losses_gen.append(l_gen)
@@ -305,7 +319,7 @@ with tf.Session() as sess:
         test_bpd.append(test_loss_gen)
 
         # log progress to console
-        print("Iteration %d, time = %ds, train bits_per_dim = %.4f, test bits_per_dim = %.4f discriminator train = %.4f, discriminator test = %4.f, nll test = %.4f" % (epoch, time.time()-begin, train_loss_gen, test_loss_gen, train_loss_dis, test_loss_dis, test_nll_gen))
+        print("Iteration %d, time = %ds, train bits_per_dim = %.4f, test bits_per_dim = %.4f discriminator train = %.4f, discriminator test = %.4f, nll test = %.4f" % (epoch, time.time()-begin, train_loss_gen, test_loss_gen, train_loss_dis, test_loss_dis, test_nll_gen))
         sys.stdout.flush()
 
         if epoch % args.save_interval == 0:

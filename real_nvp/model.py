@@ -25,10 +25,10 @@ def construct_model_spec():
 
   # final layer
   scale = num_scales-1
-  layers.append(nn.CouplingLayer('checkerboard0', use_batchnorm=True, name='Checkerboard%d_1' % scale))
-  layers.append(nn.CouplingLayer('checkerboard1', use_batchnorm=True, name='Checkerboard%d_2' % scale))
-  layers.append(nn.CouplingLayer('checkerboard0', use_batchnorm=True, name='Checkerboard%d_3' % scale))
-  layers.append(nn.CouplingLayer('checkerboard1', use_batchnorm=True, name='Checkerboard%d_4' % scale))
+  layers.append(nn.CouplingLayer('checkerboard0', hidden_dim=128, name='Checkerboard%d_1' % scale))
+  layers.append(nn.CouplingLayer('checkerboard1', hidden_dim=128, name='Checkerboard%d_2' % scale))
+  layers.append(nn.CouplingLayer('checkerboard0', hidden_dim=128, name='Checkerboard%d_3' % scale))
+  layers.append(nn.CouplingLayer('checkerboard1', hidden_dim=128, name='Checkerboard%d_4' % scale))
   layers.append(nn.FactorOutLayer(scale, name='FactorOut%d' % scale))
 
 
@@ -42,12 +42,7 @@ def model_spec(x, init=True, ema=None):
   xs = nn.int_shape(x)
   sum_log_det_jacobians = tf.zeros(xs[0])    
 
-  # corrupt data (Tapani Raiko's dequantization)
-  y = x*0.5 + 0.5
-  y = y*255.0
-  corruption_level = 1.0
-  y = y + corruption_level * tf.random_uniform(xs)
-  y = y/(255.0 + corruption_level)
+  y = x*0.5+0.5
 
   #model logit instead of the x itself    
   alpha = 1e-5
@@ -84,6 +79,14 @@ def inv_model_spec(y):
 
   # inverse logit
   x = tf.inv(1 + tf.exp(-x))
+  #alpha = 1e-5
+  #x = (x-alpha*0.5)/(1-alpha)
+  
+  # scale to [-1,1]
+  x = (x-0.5)*2.0
+  x = tf.clip_by_value(x, -1.0, 1.0)
+  
+  
 
   return x
     

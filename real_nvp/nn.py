@@ -15,9 +15,10 @@ class CouplingLayer(Layer):
 
   # |use_batchnorm|: whether using batch norm at the very output of l,m.
   # Batchnorm is used for all other convolutions regardless of this flag
-  def __init__(self, mask_type, use_batchnorm = True, name='Coupling'):
+  def __init__(self, mask_type, hidden_dim=64, use_batchnorm = True, name='Coupling'):
     self.mask_type = mask_type
     self.name = name
+    self.hidden_dim=hidden_dim
 
     # for batch normalization using moving average
     self.use_batchnorm = use_batchnorm
@@ -30,7 +31,7 @@ class CouplingLayer(Layer):
   def batch_norm(self, x):
     mu = tf.reduce_mean(x)
     sig2 = tf.reduce_mean(tf.square(x-mu))    
-    x = (x-mu)/tf.sqrt(sig2 + 1.0e-6)
+    x = (x-mu)/tf.sqrt(sig2 + 1.0e-5)
     return x, sig2
 
   def get_normalized_weights(self, name, weights_shape):
@@ -39,7 +40,7 @@ class CouplingLayer(Layer):
     scale = tf.get_variable(name + "_scale", [1], tf.float32, 
                               tf.contrib.layers.xavier_initializer(),
                               regularizer=tf.contrib.layers.l2_regularizer(5e-5))
-    norm = tf.sqrt(tf.reduce_sum(tf.square(weights)))
+    norm = tf.sqrt(tf.reduce_sum(tf.square(weights))+1e-5)
     return weights/norm * scale
     
 
@@ -48,13 +49,15 @@ class CouplingLayer(Layer):
   # returns l,m
   def function_l_m(self,x,mask,name='function_l_m'):
     with tf.variable_scope(name):
-      channel = 64
+      channel = self.hidden_dim
       padding = 'SAME'
       xs = int_shape(x)
       kernel_h = 3
       kernel_w = 3
       input_channel = xs[3]
+      x = tf.check_numerics(x, "x has NaN")
       y = x
+
 
       y,_ = self.batch_norm(y)
       weights_shape = [1, 1, input_channel, channel]
@@ -85,8 +88,9 @@ class CouplingLayer(Layer):
       y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)    
 
       y = tf.tanh(y)
-      scale_factor = self.get_normalized_weights("weights_tanh_scale", [1])
+      scale_factor = tf.get_variable("weights_tanh_scale", [1], tf.float32, tf.contrib.layers.xavier_initializer())
       y *= scale_factor
+      y = tf.check_numerics(y, "y has NaN")
 
 
       l = y[:,:,:,:input_channel] * (-mask+1)
@@ -151,7 +155,7 @@ class CouplingLayer(Layer):
 
       y1 = y * b
       l,m = self.function_l_m(y1, b)
-      x = y1 + tf.mul( y*(-b+1.0) - m, tf.exp(-l))
+      x = y1 + tf.mul( y*(-b+1.0) - m, tf.check_numerics(tf.exp(-l), "exp inv has Nan"))
       return x, z
 
 class SqueezingLayer(Layer):
@@ -257,8 +261,9 @@ def loss(z, sum_log_det_jacobians, logits_fake=None):
 
     zs = int_shape(z)
     K = zs[0]*zs[1]*zs[2]*zs[3]*np.log(2.)
+    gamma = 0.1
 
-    combined_loss = loss_gaussianization + K*loss_adversarial
+    combined_loss = loss_gaussianization + gamma*K*loss_adversarial
   else:
     combined_loss = loss_gaussianization  
     
