@@ -34,7 +34,7 @@ def construct_model_spec():
 # the final dimension of the latent space is recorded here
 # so that it can be used for constructing the inverse model
 final_latent_dimension = []
-def model_spec(x, init=True, ema=None):
+def model_spec(x):
   counters = {}
   xs = nn.int_shape(x)
   sum_log_det_jacobians = tf.zeros(xs[0])    

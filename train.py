@@ -61,13 +61,12 @@ inv_model_spec = real_nvp_inv_model_spec
 nn = real_nvp_nn
 
 # create the model
-model_opt = {}
 model = tf.make_template('model', model_spec)
 inv_model = tf.make_template('model', inv_model_spec, unique_name_='model')
 
 x_init = tf.placeholder(tf.float32, shape=(args.init_batch_size,) + obs_shape)
 # run once for data dependent initialization of parameters
-gen_par = model(x_init, init=True, **model_opt)
+gen_par = model(x_init)
 
 # sample from the model
 x_sample = tf.placeholder(tf.float32, shape=(args.sample_batch_size, ) + obs_shape)
@@ -87,13 +86,12 @@ for i in range(args.nr_gpu):
     xs.append(tf.placeholder(tf.float32, shape=(args.batch_size, ) + obs_shape))
     with tf.device('/gpu:%d' % i):
         # train
-        gen_par,jacs = model(xs[i], ema=None, **model_opt)
+        gen_par,jacs = model(xs[i])
         loss_gen.append(nn.loss(gen_par, jacs))
         # gradients
         grads.append(tf.gradients(loss_gen[i], all_params))
         # test
-        model_opt_for_testing = model_opt
-        gen_par,jacs = model(xs[i], ema=None, **model_opt)
+        gen_par,jacs = model(xs[i])
         loss_gen_test.append(nn.loss(gen_par, jacs))
 
 # add gradients together and get training updates
