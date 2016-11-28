@@ -58,6 +58,7 @@ def model_spec(x):
 
   # construct forward pass    
   z = None
+  jac = sum_log_det_jacobians
   for layer in layers:
     y,jac,z = layer.forward_and_jacobian(y, jac, z)
 
