@@ -4,6 +4,8 @@ import tensorflow as tf
 def int_shape(x):
     return list(map(int, x.get_shape()))
 
+# Abstract class that can propagate both forward/backward,
+# along with jacobians.
 class Layer():
   def forward_and_jacobian(self, x, sum_log_det_jacobians, z):
     raise NotImplementedError(str(type(self)))
@@ -11,27 +13,19 @@ class Layer():
   def backward(self, y, z):
     raise NotImplementedError(str(type(self)))
 
+# The coupling layer.
+# Contains code for both checkerboard and channelwise masking.
 class CouplingLayer(Layer):
 
-  # |use_batchnorm|: whether using batch norm at the very output of l,m.
-  # Batchnorm is used for all other convolutions regardless of this flag
-  def __init__(self, mask_type, hidden_dim=64, use_batchnorm = True, name='Coupling'):
+  # |mask_type| can be 'checkerboard0', 'checkerboard1', 'channel0', 'channel1'
+  def __init__(self, mask_type, name='Coupling'):
     self.mask_type = mask_type
     self.name = name
-    self.hidden_dim=hidden_dim
-
-    # for batch normalization using moving average
-    self.use_batchnorm = use_batchnorm
-    self.mu_l = tf.zeros([1], name=name+"/mu_l")
-    self.sig2_l = tf.ones([1], name=name+"/sig2_l")
-    self.mu_m = tf.zeros([1], name=name+"/mu_m")
-    self.sig2_m = tf.ones([1], name=name+"/sig2_m")
-    self.momentum = 0.5
 
   def batch_norm(self, x):
     mu = tf.reduce_mean(x)
     sig2 = tf.reduce_mean(tf.square(x-mu))    
-    x = (x-mu)/tf.sqrt(sig2 + 1.0e-5)
+    x = (x-mu)/tf.sqrt(sig2 + 1.0e-6)
     return x, sig2
 
   def get_normalized_weights(self, name, weights_shape):
@@ -40,7 +34,7 @@ class CouplingLayer(Layer):
     scale = tf.get_variable(name + "_scale", [1], tf.float32, 
                               tf.contrib.layers.xavier_initializer(),
                               regularizer=tf.contrib.layers.l2_regularizer(5e-5))
-    norm = tf.sqrt(tf.reduce_sum(tf.square(weights))+1e-5)
+    norm = tf.sqrt(tf.reduce_sum(tf.square(weights)))
     return weights/norm * scale
     
 
@@ -49,13 +43,12 @@ class CouplingLayer(Layer):
   # returns l,m
   def function_l_m(self,x,mask,name='function_l_m'):
     with tf.variable_scope(name):
-      channel = self.hidden_dim
+      channel = 32
       padding = 'SAME'
       xs = int_shape(x)
       kernel_h = 3
       kernel_w = 3
       input_channel = xs[3]
-      x = tf.check_numerics(x, "x has NaN")
       y = x
 
       y,_ = self.batch_norm(y)
@@ -86,11 +79,9 @@ class CouplingLayer(Layer):
       weights = self.get_normalized_weights("weights_output", [1, 1, channel, input_channel*2])
       y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)    
 
-      
       y = tf.tanh(y)
-      scale_factor = tf.get_variable("weights_tanh_scale", [1], tf.float32, tf.contrib.layers.xavier_initializer())
+      scale_factor = self.get_normalized_weights("weights_tanh_scale", [1])
       y *= scale_factor
-      y = tf.check_numerics(y, "y has NaN")
 
 
       l = y[:,:,:,:input_channel] * (-mask+1)
@@ -136,15 +127,8 @@ class CouplingLayer(Layer):
       x1 = x * b
       l,m = self.function_l_m(x1, b)
       y = x1 + tf.mul(-b+1.0, x*tf.check_numerics(tf.exp(l), "exp has NaN") + m)
-      log_det_jacobian = tf.check_numerics(tf.reduce_sum(l, [1,2,3]), "l has NaN")
+      log_det_jacobian = tf.reduce_sum(l, [1,2,3])
       sum_log_det_jacobians += log_det_jacobian
-
-      #y,sig2 = self.batch_norm(y)
-      #sum_log_det_jacobians += -xs[1]*xs[2]*xs[3]*0.5*tf.log(sig2 + 1e-6)
-      
-
-      #log_det_jacobian += xs[1]*xs[2]*xs[3]*0.5*tf.log(tf.sqrt(self.sig2_l + 1e-5)*10)
-      
 
       return y,sum_log_det_jacobians, z
 
@@ -155,9 +139,12 @@ class CouplingLayer(Layer):
 
       y1 = y * b
       l,m = self.function_l_m(y1, b)
-      x = y1 + tf.mul( y*(-b+1.0) - m, tf.check_numerics(tf.exp(-l), "exp inv has Nan"))
+      x = y1 + tf.mul( y*(-b+1.0) - m, tf.exp(-l))
       return x, z
 
+# The layer that performs squeezing.
+# Only changes the dimension.
+# The Jacobian is untouched and just passed to the next layer
 class SqueezingLayer(Layer):
   def __init__(self, name="Squeeze"):
     self.name = name
@@ -165,7 +152,6 @@ class SqueezingLayer(Layer):
   def forward_and_jacobian(self, x, sum_log_det_jacobians, z):
     xs = int_shape(x)
     assert xs[1] % 2 == 0 and xs[2] % 2 == 0
-    #y = tf.reshape(x, [xs[0], xs[1]//2, xs[2]//2, xs[3]*4])
     y = tf.space_to_depth(x, 2)
     if z is not None:
       z = tf.space_to_depth(z, 2)      
@@ -175,7 +161,6 @@ class SqueezingLayer(Layer):
   def backward(self, y, z):
     ys = int_shape(y)
     assert ys[3] % 4 == 0
-    #x = tf.reshape(y, [ys[0], ys[1]*2, ys[2]*2, ys[3]//4])
     x = tf.depth_to_space(y,2)
 
     if z is not None:
@@ -183,6 +168,8 @@ class SqueezingLayer(Layer):
 
     return x, z
 
+# The layer that factors out half of the variables
+# directly to the latent space.  
 class FactorOutLayer(Layer):
   def __init__(self, scale, name='FactorOut'):
     self.scale = scale
@@ -193,6 +180,8 @@ class FactorOutLayer(Layer):
     xs = int_shape(x)
     split = xs[3]//2
 
+    # The factoring out is done on the channel direction.
+    # Haven't experimented with other ways of factoring out.
     new_z = x[:,:,:,:split]
     x = x[:,:,:,split:]
 
@@ -225,11 +214,6 @@ class FactorOutLayer(Layer):
 
     return x, z
             
-    
-    
-
-
-
 # Given the output of the network and all jacobians, 
 # compute the log probability. 
 # Equation (3) of the RealNVP paper
@@ -240,48 +224,29 @@ def compute_log_prob_x(z, sum_log_det_jacobians):
   zs = int_shape(z)
   K = zs[1]*zs[2]*zs[3] #dimension of the Gaussian distribution
 
-  log_density_z = -0.5*tf.reduce_sum(tf.check_numerics(tf.square(z), "square z"), [1,2,3]) - 0.5*K*np.log(2*np.pi)
+  log_density_z = -0.5*tf.reduce_sum(tf.square(z), [1,2,3]) - 0.5*K*np.log(2*np.pi)
 
-  log_density_x = tf.check_numerics(log_density_z, "log_density_z") + \
-                  tf.check_numerics(sum_log_det_jacobians, "sum_log_det_jacobians")
+  log_density_x = log_density_z + sum_log_det_jacobians
 
   # to go from density to probability, one can 
   # multiply the density by the width of the 
-  # discrete probability area, which is 1/256.0, per dimension
+  # discrete probability area, which is 1/256.0, per dimension.
+  # The calculation is performed in the log space.
   log_prob_x = log_density_x - K*tf.log(256.0)
 
-  return tf.check_numerics(log_prob_x, "log_prob_x has NaN")
+  return log_prob_x
 
 
-def loss(z, sum_log_det_jacobians, logits_fake=None, logits_real=None):
-  loss_gaussianization = -tf.reduce_sum(compute_log_prob_x(z, sum_log_det_jacobians))
-
-  if logits_fake is not None and logits_real is not None:
-    #loss_adversarial = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits_real, tf.zeros_like(logits_fake)))
-
-    #loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits_real, tf.ones_like(logits_real)))
-    #loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits_fake, tf.zeros_like(logits_fake)))
-
-    #loss_adversarial = -loss_real + -loss_fake
-    loss_adversarial = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits_fake, tf.ones_like(logits_fake)))
-    
-
-
-    zs = int_shape(z)
-    K = zs[0]*zs[1]*zs[2]*zs[3]*np.log(2.)
-    gamma = 0.01
-
-    combined_loss = loss_gaussianization + gamma*K*loss_adversarial
-    #combined_loss = K*loss_adversarial
-  else:
-    combined_loss = loss_gaussianization  
-    
-  return combined_loss
-
-
-
+# Computes the loss of the network. 
+# It is chosen so that the probability P(x) of the 
+# natural images is maximized.
+def loss(z, sum_log_det_jacobians):
+  return -tf.reduce_sum(compute_log_prob_x(z, sum_log_det_jacobians))
   
-  
+
+# Adam optimizer.
+# Exactly the same code as the PixelCNN++ implementation by OpenAI.
+# https://github.com/openai/pixel-cnn
 def adam_updates(params, cost_or_grads, lr=0.001, mom1=0.9, mom2=0.999):
     ''' Adam optimizer '''
     updates = []
