@@ -45,7 +45,7 @@ class CouplingLayer(Layer):
   # (Function m and l became s and t in the new version of the paper)
   def function_l_m(self,x,mask,name='function_l_m'):
     with tf.variable_scope(name):
-      channel = 32
+      channel = 64
       padding = 'SAME'
       xs = int_shape(x)
       kernel_h = 3
