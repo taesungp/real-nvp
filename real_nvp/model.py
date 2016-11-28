@@ -77,10 +77,8 @@ def inv_model_spec(y):
   for layer in reversed(layers):
     y,z = layer.backward(y,z)
     
-  x = y
-
   # inverse logit
-  x = tf.inv(1 + tf.exp(-x))
+  x = tf.inv(1 + tf.exp(-y))
 
   return x
     
