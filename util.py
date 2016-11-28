@@ -3,7 +3,6 @@ import numpy as np
 import time
 import matplotlib.pyplot as plt
 from pylab import rcParams
-#rcParams['figure.figsize'] = 12,22
 
 def show_all_variables():
   total_count = 0

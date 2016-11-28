@@ -11,23 +11,15 @@ import argparse
 
 import numpy as np
 import tensorflow as tf
-import matplotlib.pyplot as plt
-from pylab import rcParams
-rcParams['figure.figsize'] = 12,22
-import datetime
-import dateutil.tz
-import scipy.misc
-from scipy import misc,ndimage
-from skimage import io, color
-import time
 
 import real_nvp.nn as real_nvp_nn
-import plotting
 from real_nvp.model import model_spec as real_nvp_model_spec
 from real_nvp.model import inv_model_spec as real_nvp_inv_model_spec
 import data.cifar10_data as cifar10_data
 import data.imagenet_data as imagenet_data
 import util
+import plotting
+
 
 # -----------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
@@ -123,7 +115,7 @@ bits_per_dim_test = loss_gen_test[0]/(args.nr_gpu*np.log(2.)*np.prod(obs_shape)*
 initializer = tf.initialize_all_variables()
 saver = tf.train.Saver()
 
-# input to pixelCNN is scaled from uint8 [0,255] to float in range [-1,1]
+# input is scaled from uint8 [0,255] to float in range [-1,1]
 def prepro(x):
   return np.cast[np.float32]((x - 127.5) / 127.5)
 
@@ -158,31 +150,27 @@ with tf.Session() as sess:
         
         # train for one epoch
         train_losses = []
-        skip_train = False
-        if not skip_train:
-          print ("Training (%d/%d) started" % (epoch, args.max_epochs))
-          for t,x in enumerate(train_data):          
-            # prepro the data and split it for each gpu
-            xf = prepro(x)
-            xfs = np.split(xf, args.nr_gpu)
-            lr *= args.lr_decay
-            feed_dict = { tf_lr: lr }
-            feed_dict.update({ xs[i]: xfs[i] for i in range(args.nr_gpu) })
-            l,_ = sess.run([bits_per_dim, optimizer], feed_dict)
-            train_losses.append(l)
+        print ("Training (%d/%d) started" % (epoch, args.max_epochs))
+        for t,x in enumerate(train_data):          
+          # prepro the data and split it for each gpu
+          xf = prepro(x)
+          xfs = np.split(xf, args.nr_gpu)
+          lr *= args.lr_decay
+          feed_dict = { tf_lr: lr }
+          feed_dict.update({ xs[i]: xfs[i] for i in range(args.nr_gpu) })
+          l,_ = sess.run([bits_per_dim, optimizer], feed_dict)
+          train_losses.append(l)
         train_loss_gen = np.mean(train_losses)
 
         # compute likelihood over test split
         test_losses = []
-        skip_test = False
-        if not skip_test:
-          print ("Testing...")
-          for x in test_data:
-            xf = prepro(x)
-            xfs = np.split(xf, args.nr_gpu)
-            feed_dict = { xs[i]: xfs[i] for i in range(args.nr_gpu) }
-            l = sess.run(bits_per_dim_test, feed_dict)
-            test_losses.append(l)
+        print ("Testing...")
+        for x in test_data:
+          xf = prepro(x)
+          xfs = np.split(xf, args.nr_gpu)
+          feed_dict = { xs[i]: xfs[i] for i in range(args.nr_gpu) }
+          l = sess.run(bits_per_dim_test, feed_dict)
+          test_losses.append(l)
         test_loss_gen = np.mean(test_losses)
         test_bpd.append(test_loss_gen)
 
