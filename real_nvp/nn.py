@@ -22,12 +22,15 @@ class CouplingLayer(Layer):
     self.mask_type = mask_type
     self.name = name
 
+  # Batch normalization. 
+  # TODO: Moving average batch normaliation
   def batch_norm(self, x):
     mu = tf.reduce_mean(x)
     sig2 = tf.reduce_mean(tf.square(x-mu))    
     x = (x-mu)/tf.sqrt(sig2 + 1.0e-6)
     return x, sig2
 
+  # Weight normalization technique
   def get_normalized_weights(self, name, weights_shape):
     weights = tf.get_variable(name, weights_shape, tf.float32,
                               tf.contrib.layers.xavier_initializer())
@@ -37,10 +40,9 @@ class CouplingLayer(Layer):
     norm = tf.sqrt(tf.reduce_sum(tf.square(weights)))
     return weights/norm * scale
     
-
   
   # corresponds to the function m and l in the RealNVP paper
-  # returns l,m
+  # (Function m and l became s and t in the new version of the paper)
   def function_l_m(self,x,mask,name='function_l_m'):
     with tf.variable_scope(name):
       channel = 32
@@ -60,6 +62,7 @@ class CouplingLayer(Layer):
       y = tf.nn.relu(y)
 
       skip = y
+      # Residual blocks
       num_residual_blocks = 8
       for r in range(num_residual_blocks):        
         weights_shape = [kernel_h, kernel_w, channel, channel]
@@ -76,14 +79,18 @@ class CouplingLayer(Layer):
         skip = y
 
         
-      weights = self.get_normalized_weights("weights_output", [1, 1, channel, input_channel*2])
+      # 1x1 convolution for reducing dimension
+      weights = self.get_normalized_weights("weights_output", 
+                                            [1, 1, channel, input_channel*2])
       y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)    
 
+      # For numerical stability, apply tanh and then scale
       y = tf.tanh(y)
       scale_factor = self.get_normalized_weights("weights_tanh_scale", [1])
       y *= scale_factor
 
-
+      # The first half defines the l function
+      # The second half defines the m function
       l = y[:,:,:,:input_channel] * (-mask+1)
       m = y[:,:,:,input_channel:] * (-mask+1)
       

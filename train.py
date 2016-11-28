@@ -22,9 +22,7 @@ from skimage import io, color
 import time
 
 import real_nvp.nn as real_nvp_nn
-import pixel_cnn_pp.plotting as plotting
-import pixel_cnn_pp.scopes as scopes
-from pixel_cnn_pp.model import model_spec as pixel_cnn_model_spec
+import plotting
 from real_nvp.model import model_spec as real_nvp_model_spec
 from real_nvp.model import inv_model_spec as real_nvp_inv_model_spec
 import data.cifar10_data as cifar10_data
@@ -157,9 +155,7 @@ with tf.Session() as sess:
                 print('restoring parameters from', ckpt_file)
                 saver.restore(sess, ckpt_file)
             util.show_all_variables()
-
         
-
         # train for one epoch
         train_losses = []
         skip_train = False
