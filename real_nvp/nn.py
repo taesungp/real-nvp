@@ -58,7 +58,6 @@ class CouplingLayer(Layer):
       x = tf.check_numerics(x, "x has NaN")
       y = x
 
-
       y,_ = self.batch_norm(y)
       weights_shape = [1, 1, input_channel, channel]
       weights = self.get_normalized_weights("weights_input", weights_shape)
@@ -87,6 +86,7 @@ class CouplingLayer(Layer):
       weights = self.get_normalized_weights("weights_output", [1, 1, channel, input_channel*2])
       y = tf.nn.conv2d(y, weights, [1, 1, 1, 1], padding=padding)    
 
+      
       y = tf.tanh(y)
       scale_factor = tf.get_variable("weights_tanh_scale", [1], tf.float32, tf.contrib.layers.xavier_initializer())
       y *= scale_factor
@@ -253,17 +253,26 @@ def compute_log_prob_x(z, sum_log_det_jacobians):
   return tf.check_numerics(log_prob_x, "log_prob_x has NaN")
 
 
-def loss(z, sum_log_det_jacobians, logits_fake=None):
+def loss(z, sum_log_det_jacobians, logits_fake=None, logits_real=None):
   loss_gaussianization = -tf.reduce_sum(compute_log_prob_x(z, sum_log_det_jacobians))
 
-  if logits_fake is not None:
+  if logits_fake is not None and logits_real is not None:
+    #loss_adversarial = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits_real, tf.zeros_like(logits_fake)))
+
+    #loss_real = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits_real, tf.ones_like(logits_real)))
+    #loss_fake = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits_fake, tf.zeros_like(logits_fake)))
+
+    #loss_adversarial = -loss_real + -loss_fake
     loss_adversarial = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(logits_fake, tf.ones_like(logits_fake)))
+    
+
 
     zs = int_shape(z)
     K = zs[0]*zs[1]*zs[2]*zs[3]*np.log(2.)
-    gamma = 0.1
+    gamma = 0.01
 
     combined_loss = loss_gaussianization + gamma*K*loss_adversarial
+    #combined_loss = K*loss_adversarial
   else:
     combined_loss = loss_gaussianization  
     

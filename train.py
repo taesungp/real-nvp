@@ -56,7 +56,7 @@ parser.add_argument('-l', '--learning_rate', type=float, default=0.001, help='Ba
 parser.add_argument('-e', '--lr_decay', type=float, default=0.999995, help='Learning rate decay, applied every step of the optimization')
 parser.add_argument('-b', '--batch_size', type=int, default=12, help='Batch size during training per GPU')
 parser.add_argument('-p', '--dropout_p', type=float, default=0.5, help='Dropout strength (i.e. 1 - keep_prob). 0 = No dropout, higher = more dropout.')
-parser.add_argument('-x', '--max_epochs', type=int, default=5000, help='How many epochs to run in total?')
+parser.add_argument('-x', '--max_epochs', type=int, default=50000, help='How many epochs to run in total?')
 parser.add_argument('-g', '--nr_gpu', type=int, default=8, help='How many GPUs to distribute the training across?')
 # evaluation
 parser.add_argument('--sample_batch_size', type=int, default=16, help='How many images to process in paralell during sampling?')
@@ -95,7 +95,8 @@ discriminator_model = tf.make_template('discriminator_model', discriminator_mode
 x_init = tf.placeholder(tf.float32, shape=(args.batch_size,) + obs_shape)
 # run once for data dependent initialization of parameters
 gen_par,_ = model(x_init, init=True, **model_opt)
-discriminator_par = discriminator_model(gen_par, init=True, **model_opt)
+#discriminator_par = discriminator_model(gen_par, init=True, **model_opt)
+discriminator_par = discriminator_model(x_init, init=True, **model_opt)
 
 # keep track of moving average
 all_params = tf.trainable_variables()
@@ -154,15 +155,20 @@ for i in range(args.nr_gpu):
       #random_z = tf.random_normal(nn.int_shape(z)) * mask +\
       #           z * (1.0-mask)
       random_z = tf.random_normal(nn.int_shape(z))
+      #random_z = tf.random_uniform(nn.int_shape(z))*0.1+0.3
+      #random_z = tf.random_normal([nn.int_shape(z)[0], 4, 4, 1])
+      #random_z = tf.tile(random_z,[1,nn.int_shape(z)[1]//4,nn.int_shape(z)[2]//4,nn.int_shape(z)[3]])
       
-      #sampled_x = inv_model(random_z)
-      #d_logits_of_fake = discriminator_model(sampled_x, ema=None, **model_opt)
-      #d_logits_of_real = discriminator_model(xs[i], ema=None, **model_opt)
-      d_logits_of_fake = discriminator_model(random_z, ema=None, **model_opt)
-      d_logits_of_real = discriminator_model(z, ema=None, **model_opt)
+      sampled_x = inv_model(random_z)
+      #distorted_x = xs[i] + tf.random_uniform(nn.int_shape(xs[i]), -0.1, 0.1)
+      #distorted_x = tf.clip_by_value(distorted_x, -1.0, 1.0)
+      d_logits_of_fake = discriminator_model(sampled_x, ema=None, **model_opt)
+      d_logits_of_real = discriminator_model(xs[i], ema=None, **model_opt)
+      #d_logits_of_fake = discriminator_model(random_z, ema=None, **model_opt)
+      #d_logits_of_real = discriminator_model(z, ema=None, **model_opt)
       
       # loss of generator
-      loss_gen.append(nn.loss(z, jacs, d_logits_of_fake))
+      loss_gen.append(nn.loss(z, jacs, d_logits_of_fake, d_logits_of_real))
 
       # loss of discriminator
       loss_dis.append(dn.loss(d_logits_of_real, d_logits_of_fake))
@@ -173,7 +179,7 @@ for i in range(args.nr_gpu):
       
       # test
       z,jacs = model(xs[i], ema=None, **model_opt)
-      loss_gen_test.append(nn.loss(z, jacs, d_logits_of_fake))
+      loss_gen_test.append(nn.loss(z, jacs, d_logits_of_fake, d_logits_of_real))
       nll_test.append(nn.loss(z, jacs))
       loss_dis_test.append(dn.loss(d_logits_of_real, d_logits_of_fake))
 
@@ -204,6 +210,7 @@ nll_bits_per_dim_test = nll_test[0]/(args.nr_gpu*np.log(2.)*np.prod(obs_shape)*a
 # convert discriminator loss
 discriminator_loss = loss_dis[0]/args.nr_gpu
 discriminator_loss_test = loss_dis_test[0]/args.nr_gpu
+
 
 # init & save
 initializer = tf.initialize_all_variables()
@@ -243,6 +250,7 @@ def compute_likelihood(xf):
 
 
 # //////////// perform training //////////////
+gen_mode = True
 if not os.path.exists(args.save_dir):
     os.makedirs(args.save_dir)
 print('starting training')
@@ -280,13 +288,25 @@ with tf.Session() as sess:
           lr *= args.lr_decay
           feed_dict = { tf_lr: lr }
           feed_dict.update({ xs[i]: xfs[i] for i in range(args.nr_gpu) })
-          if last_l_dis < 0.02:
-            # only train generator
+          if gen_mode:
+            # only train generator        
             l_gen, l_dis, _ = sess.run([bits_per_dim, discriminator_loss, 
-                                       optimizer_gen], feed_dict)
+                                        optimizer_gen], feed_dict)
+          #if t%4==0 and last_l_dis >= 0.2:
           else:
-            l_gen, l_dis,_,_ = sess.run([bits_per_dim, discriminator_loss, 
-                                         optimizer_gen, optimizer_dis], feed_dict)
+            sys.stdout.write('dis trained ')
+            l_gen, l_dis, _ = sess.run([bits_per_dim, discriminator_loss, 
+                                        optimizer_dis], feed_dict)
+
+          if l_dis > 0.4 and gen_mode:
+            sys.stdout.write('[')
+            gen_mode = False
+          elif gen_mode == False and l_dis < 0.1:
+            sys.stdout.write(']')
+            gen_mode = True
+          
+          #l_gen, l_dis,_,_ = sess.run([bits_per_dim, discriminator_loss, 
+          #                             optimizer_gen, optimizer_dis], feed_dict)
           #sys.stdout.write('discriminator trained ')          
           last_l_dis = l_dis
           if t%10==0:

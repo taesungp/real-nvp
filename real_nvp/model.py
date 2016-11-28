@@ -71,6 +71,7 @@ def inv_model_spec(y):
   # construct inverse pass for sampling
   shape = final_latent_dimension
   z = tf.reshape(y, [-1, shape[1], shape[2], shape[3]])
+
   y = None
   for layer in reversed(layers):
     y,z = layer.backward(y,z)
@@ -78,15 +79,23 @@ def inv_model_spec(y):
   x = y
 
   # inverse logit
-  x = tf.inv(1 + tf.exp(-x))
-  #alpha = 1e-5
+  x = tf.clip_by_value(x,-11.0,11.0) # for numerical stability
+  x = tf.sigmoid(x)
+  #x = tf.clip_by_value(x, 0.3, 0.7)
+  alpha = 1e-5
   #x = (x-alpha*0.5)/(1-alpha)
+  x = x*(1-alpha) + alpha*0.5
   
+  # quantize
+  #x = tf.floor(x*255.0)
+  
+  # dequantize using uniform distribution
+  #x = x + tf.random_uniform(nn.int_shape(x))/256.0
+  #x = x/256.0
+
   # scale to [-1,1]
   x = (x-0.5)*2.0
-  x = tf.clip_by_value(x, -1.0, 1.0)
-  
-  
+  x = tf.clip_by_value(x, -1.0, 1.0)    
 
   return x
     
