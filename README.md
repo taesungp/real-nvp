@@ -13,4 +13,4 @@ $ CUDA_VISIBLE_DEVICES=1,2 python3 train.py --nr_gpu=2 --data_dir=download --sav
 
 Sample image from the model trained on CIFAR10. The test NLL was 3.51. 
 
-![alt tag](cifar_sample.png)
+![alt tag](https://github.com/taesung89/real-nvp/raw/master/cifar_sample.png)
