@@ -208,8 +208,7 @@ class FactorOutLayer(Layer):
     # Hence, at backward pass of scale s, (1/2)^(s) of z should be factored in
     
     zs = int_shape(z)
-    split = zs[3] // (2**self.scale)
-    new_y = z[:,:,:,-split:]
+    if y is None:                                                                                 split = zs[3] // (2**self.scale)                                                          else:                                                                                         split = int_shape(y)[3]                                                                   new_y = z[:,:,:,-split:]
     z = z[:,:,:,:-split]
 
     assert (int_shape(new_y)[3] == split)
