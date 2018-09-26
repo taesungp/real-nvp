@@ -1,3 +1,9 @@
+# Note
+
+I wrote this code before the official implementation got released. Now that the official implementation is part of Tensorflow, this codebase is not maintained anymore. Please refer to the official repo. 
+
+https://github.com/tensorflow/models/tree/master/research/real_nvp
+
 # real-nvp
 Implementation of Real-NVP (https://arxiv.org/abs/1605.08803) in Tensorflow.
 
